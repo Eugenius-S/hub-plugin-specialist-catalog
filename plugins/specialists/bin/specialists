@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+"""Specialists catalog: ready-made hub agents as packages (a git repo with hub-plugin.json of kind "specialist",
+a CLAUDE.md profile and eval cases).
+
+    specialists list                                     what the catalog offers and what is installed
+    specialists install <name|folder|git-url> [--name N] [--cwd DIR] [--tools need|all|none] [--trial] [--no-notify]
+                                                         check the package, create the agent, hand it its profile,
+                                                         verify the agent file, ask for its tools; --trial: a plain
+                                                         session (not an agent) with CLAUDE.md in its own folder
+    specialists verify <agent>                           compare the agent file with the package profile again;
+                                                         equal: reload the agent and mark it ready
+    specialists adopt <agent> [<package|folder|git-url>] put a live agent installed by hand under the catalog
+                                                         (a record only; its CLAUDE.md and tools are left as they are)
+    specialists update <agent>                           a new package version: the new profile is handed to the agent
+                                                         and verified; sections between <!-- specialists:local --> and
+                                                         <!-- /specialists:local --> are carried over
+    specialists remove <agent>                           drop the record; the hub removes the session (the agent file
+                                                         stays); a trial session is removed here
+
+Only the hub or the owner installs: `hub session new` from a working session is just a request to the hub.
+The plugin never writes the hub's settings or another component's files: the agent file is written by the agent itself
+on request, the plugin only reads it back. Its own files: <hub state>/specialists/ (state.json, profiles/, trial/).
+The catalog is a JSON list [{name, repo, version, icon?, about?}]: the `catalog` setting of the plugin, SPECIALISTS_CATALOG
+or specialists.json next to the plugin. Stdlib only."""
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CATALOG = os.environ.get("SPECIALISTS_CATALOG") or os.path.join(HERE, "..", "..", "..", "specialists.json")
+HUB = os.environ.get("SPECIALISTS_HUB") or ""   # an explicit hub command (wins over everything)
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,39}")   # same as hub session names
+AGENT_FILE, CWD = "{AGENT_FILE}", "{CWD}"
+LOCAL_OPEN, LOCAL_CLOSE = "<!-- specialists:local -->", "<!-- /specialists:local -->"   # agent-file sections update keeps
+WAIT = float(os.environ.get("SPECIALISTS_WAIT", "20"))           # s: how long to wait for the core to create a session
+PROFILE_WAIT = float(os.environ.get("SPECIALISTS_PROFILE_WAIT", "300"))   # s: how long the agent has to write its file
+DOWN = ("asleep", "parked", "retired", "closed", "failed", "removed")    # states a session can be removed from
+BUSY = ("busy", "dialog", "starting")                                    # a reload now would cut a turn
+REJECTED = ("rejected", "отклонено")    # how `hub` starts a refusal (English and Russian hubs)
+RISK = ("risk:", "риск:")               # how `hub tools list` marks a risky tool
+
+# Secret detection: the same patterns the hub uses for its sync (one detector per hub: a new kind of key goes to both)
+SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|"
+                    r"AKIA[0-9A-Z]{16}|Bearer\s+[A-Za-z0-9._-]{20,}|\b\d{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])|"
+                    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
+                    r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----)?|"
+                    r"(?:api[_-]?key|token|secret|password)[\"']?\s*[:=]\s*[\"']?[^\s\"']{12,})", re.I)
+LEAKS = (("personal path", re.compile(r"/Users/|/home/[A-Za-z]|[A-Za-z]:\\Users\\", re.I)),
+         ("cloud drive", re.compile(r"Dropbox|Google ?Drive|iCloud|OneDrive|CloudStorage", re.I)),
+         ("task or message number", re.compile(r"\b[qmd]\d{3,}\b")))
+TEXT = {".md", ".json", ".txt", ".py", ".sh", ".yml", ".yaml", ".toml", ".js", ".mjs", ".html", ".css", ""}
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+def die(text):
+    sys.exit(text)
+
+
+def refused(code, out):
+    return bool(code) or out.lower().startswith(REJECTED)
+
+
+# --- hub ---------------------------------------------------------------------------------------------------------
+
+def hub_cmd():
+    """The hub command: SPECIALISTS_HUB; else the path from PATH (on Windows hub.cmd: CreateProcess ignores PATHEXT);
+    else the HUB_NESTED_PYTHON + HUB_NESTED_HUB pair the hub gives its sessions."""
+    if HUB:
+        return HUB.split() if " " in HUB and not os.path.exists(HUB) else [HUB]
+    found = shutil.which("hub")
+    if found:
+        return [found]
+    py, hub = os.environ.get("HUB_NESTED_PYTHON"), os.environ.get("HUB_NESTED_HUB")
+    return [py, hub] if py and hub else ["hub"]
+
+
+def utf8_streams():
+    """Output is always UTF-8: on Windows stdout/stderr into a pipe are cp1251/cp866."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
+def hub_run(*args):
+    """(exit code, output) of a hub command. Replaced in tests."""
+    out = subprocess.run([*hub_cmd(), *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return out.returncode, (out.stdout + out.stderr).strip()
+
+
+def hub_status():
+    code, out = hub_run("status", "--json")
+    try:
+        return json.loads(out)
+    except ValueError:
+        die("hub status --json gave no answer: is the hub running? " + out[:200])
+
+
+def hub_version():
+    """The hub's major version from `hub version` ("… v1.5.1 …"); None if it cannot be read."""
+    m = re.search(r"\bv?(\d+)\.(\d+)", hub_run("version")[1])
+    return int(m.group(1)) if m else None
+
+
+def state_dir():
+    return os.path.expanduser(os.environ.get("HUB_STATE_DIR") or os.environ.get("HUB_STATE") or "~/.hub-core")
+
+
+def own_dir():
+    return os.path.join(state_dir(), "specialists")
+
+
+def state_path():
+    return os.path.join(own_dir(), "state.json")
+
+
+def load_state():
+    try:
+        with open(state_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"installed": {}}
+
+
+def save_state(st):
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def load_catalog():
+    try:
+        with open(CATALOG, encoding="utf-8") as f:
+            return [x for x in json.load(f) if isinstance(x, dict) and x.get("name")]
+    except (OSError, ValueError):
+        return []
+
+
+# --- package -----------------------------------------------------------------------------------------------------
+
+def fetch(repo):
+    """The package folder: a git repo (local or remote) is cloned fresh into a temp folder; a plain folder is used as is.
+    (folder, temp folder to remove afterwards or False)."""
+    local = os.path.expanduser(repo)
+    if os.path.isdir(local) and not os.path.isdir(os.path.join(local, ".git")):
+        return os.path.abspath(local), False
+    tmp = tempfile.mkdtemp(prefix="specialist-")
+    to = os.path.join(tmp, "pkg")
+    out = subprocess.run(["git", "clone", "-q", "--depth", "1", os.path.abspath(local) if os.path.isdir(local) else repo, to],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if out.returncode:
+        rmtree_force(tmp)
+        die(f"cannot fetch package {repo}: {out.stderr.strip()[:300]}")
+    return to, tmp
+
+
+def text_files(root):
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules")]
+        for f in files:
+            path = os.path.join(dirpath, f)
+            if os.path.splitext(f)[1].lower() in TEXT and os.path.getsize(path) < 2_000_000:
+                yield path
+
+
+def leaks(root):
+    """What must not be in a shared package: keys, personal paths, cloud drives, the owner's task and message numbers."""
+    found = []
+    for path in text_files(root):
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = os.path.relpath(path, root)
+        for m in SECRET.finditer(text):
+            found.append(f"{rel}: key or token ({m.group(0)[:6]}…)")
+        for kind, rx in LEAKS:
+            m = rx.search(text)
+            if m:
+                found.append(f"{rel}: {kind} (\"{m.group(0)}\", line {text.count(chr(10), 0, m.start()) + 1})")
+    return found
+
+
+def hub_spec_ok(spec, major):
+    """"^1", "1", "^1.15": the major number matches the hub's (minor numbers decide nothing for a specialist package)."""
+    m = re.fullmatch(r"\^?(\d+)(?:\.\d+)*", str(spec or "").strip())
+    return bool(m) and (major is None or int(m.group(1)) == major)
+
+
+def check(root, major):
+    """(manifest, [problems]): the package is checked before anything is done."""
+    bad = []
+    try:
+        with open(os.path.join(root, "hub-plugin.json"), encoding="utf-8") as f:
+            man = json.load(f)
+        if not isinstance(man, dict):
+            raise ValueError
+    except OSError:
+        return {}, ["no hub-plugin.json"]
+    except ValueError:
+        return {}, ["hub-plugin.json is not a JSON object"]
+    if man.get("kind") != "specialist":
+        bad.append(f"kind must be \"specialist\", not \"{man.get('kind')}\"")
+    for key in ("name", "version", "hub", "icon", "description", "why"):
+        if not str(man.get(key) or "").strip():
+            bad.append(f"no field {key}")
+    if man.get("name") and not NAME.fullmatch(str(man["name"])):
+        bad.append("name: Latin letters, digits, hyphen, up to 40 characters")
+    if man.get("hub") and not hub_spec_ok(man["hub"], major):
+        bad.append(f"hub \"{man['hub']}\" does not fit hub version {major}.x")
+    agent = man.get("agent")
+    if not isinstance(agent, dict):
+        bad.append("no agent block")
+    else:
+        if not str(agent.get("cwd") or "").strip():
+            bad.append("no agent.cwd")
+        tools = agent.get("tools")
+        if not isinstance(tools, dict) or not all(isinstance(tools.get(k), list) for k in ("need", "optional")):
+            bad.append("agent.tools.need and agent.tools.optional must be lists")
+        else:
+            for t in tools["need"] + tools["optional"]:
+                if not isinstance(t, dict) or not str(t.get("id") or "").strip():
+                    bad.append("a tool without id in agent.tools")
+                    break
+        cases = str(agent.get("cases") or "")
+        if not cases:
+            bad.append("no agent.cases")
+        elif not os.path.isfile(os.path.join(root, cases)):
+            bad.append(f"agent.cases: no file {cases} in the package")
+    try:
+        with open(os.path.join(root, "CLAUDE.md"), encoding="utf-8") as f:
+            if not f.read().strip():
+                bad.append("CLAUDE.md is empty")
+    except OSError:
+        bad.append("no CLAUDE.md")
+    bad += [f"leak: {x}" for x in leaks(root)]
+    return man, bad
+
+
+def package_plugins(root):
+    """Names of the package's own Claude Code plugins from .claude-plugin/marketplace.json (sources inside the package)."""
+    try:
+        with open(os.path.join(root, ".claude-plugin", "marketplace.json"), encoding="utf-8") as f:
+            market = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [p["name"] for p in (market.get("plugins") if isinstance(market, dict) else None) or []
+            if isinstance(p, dict) and isinstance(p.get("name"), str) and isinstance(p.get("source"), str)]
+
+
+def rmtree_force(path):
+    """A whole folder, on Windows too: .git pack files are read-only and plain rmtree leaves them."""
+    def unlock(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, onexc=unlock) if sys.version_info >= (3, 12) else shutil.rmtree(path, onerror=unlock)
+
+
+# --- profile -----------------------------------------------------------------------------------------------------
+
+def fill(text, agent_file, cwd):
+    """Package placeholders: {AGENT_FILE} is the agent file path, {CWD} its working folder."""
+    return text.replace(AGENT_FILE, agent_file).replace(CWD, cwd)
+
+
+def heading_lines(lines):
+    """[(line number, level, text)] of "#"/"##" headings outside code blocks."""
+    out, fence = [], False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fence = not fence
+        elif not fence and (m := re.match(r"(#{1,2}) +\S", line)):
+            out.append((i, len(m.group(1)), line.strip()))
+    return out
+
+
+def local_blocks(text):
+    """[(the "## " section the block stood in, None before the first; the block with its markers)] in file order."""
+    found, pos = [], 0
+    while (a := text.find(LOCAL_OPEN, pos)) >= 0:
+        b = text.find(LOCAL_CLOSE, a)
+        if b < 0:
+            break
+        b += len(LOCAL_CLOSE)
+        prev = [h for h in heading_lines(text[:a].split("\n")) if h[1] == 2]
+        found.append((prev[-1][2] if prev else None, text[a:b]))
+        pos = b
+    return found
+
+
+def carry_local(body, agent_file):
+    """(new text, whether blocks were carried): each local block of the agent file goes to the end of the same "## "
+    section of the new package profile; no such section (or the block stood before the first) — to the end, in order."""
+    try:
+        with open(agent_file, encoding="utf-8") as f:
+            blocks = local_blocks(f.read())
+    except OSError:
+        blocks = []
+    if not blocks:
+        return body, False
+    lines = body.rstrip("\n").split("\n")
+    heads = heading_lines(lines)
+    inserts, tail = {}, []                               # the line to insert before -> blocks
+    for anchor, block in blocks:
+        at = next((k for k, h in enumerate(heads) if h[1] == 2 and h[2] == anchor), None) if anchor else None
+        if at is None:
+            tail.append(block)
+            continue
+        end = next((h[0] for h in heads[at + 1:]), len(lines))
+        while end > heads[at][0] + 1 and not lines[end - 1].strip():
+            end -= 1
+        inserts.setdefault(end, []).append(block)
+    for end in sorted(inserts, reverse=True):
+        add = [x for block in inserts[end] for x in ("", *block.split("\n"))]
+        lines[end:end] = add + ([""] if end < len(lines) else [])
+    return "\n".join(lines) + "".join("\n\n" + block for block in tail) + "\n", True
+
+
+def agent_file_path(sess):
+    """The core keeps an agent's CLAUDE.md at <state>/agents/<profile or session id>/CLAUDE.md."""
+    return os.path.join(state_dir(), "agents", sess.get("profile") or sess["session_id"], "CLAUDE.md")
+
+
+def trial_cwd(agent):
+    """A trial session's own folder, not the package's working folder: removed with the session, touches nothing else."""
+    return os.path.join(own_dir(), "trial", agent)
+
+
+def profile_path(agent, suffix=""):
+    return os.path.join(own_dir(), "profiles", f"{agent}{suffix}.md")
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def norm(text):
+    """For comparison: line endings and trailing spaces do not count."""
+    return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").strip("\n").split("\n"))
+
+
+def first_diff(want, got):
+    """The first differing line, for the error message."""
+    a, b = norm(want).split("\n"), norm(got).split("\n")
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return f"line {i + 1}: expected \"{x[:80]}\", found \"{y[:80]}\""
+    return f"expected {len(a)} lines, found {len(b)}"
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def ask_agent(agent, profile, quiet):
+    """The agent writes its own file: the core gives it HUB_AGENT_FILE and the agent maintains it, the plugin does not
+    write into the core's tree."""
+    text = (f"Specialists catalog: replace the whole content of your agent file ($HUB_AGENT_FILE) with the content of "
+            f"{profile}, exactly, byte for byte, nothing added or removed. Then reply \"done\". The catalog checks the "
+            f"file and restarts you with it.")
+    notify(agent, text, quiet)
+
+
+def settle(agent, agent_file, profile, wait):
+    """Waits until the agent file equals the profile (up to wait s). True: equal."""
+    want = read(profile) or ""
+    end = time.time() + wait
+    while True:
+        got = read(agent_file)
+        if got is not None and norm(got) == norm(want):
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(1)
+
+
+def reload_when_free(agent):
+    """Restart the agent with its new file, but not in the middle of a turn: wait until it is free (up to WAIT s)."""
+    end = time.time() + WAIT
+    state = (hub_status()["sessions"].get(agent) or {}).get("state")
+    while state in BUSY and time.time() < end:
+        time.sleep(1)
+        state = (hub_status()["sessions"].get(agent) or {}).get("state")
+    if state in BUSY:
+        return say(f"  {agent} is still in a turn: restart it later with hub session reload {agent}")
+    say("  " + hub_run("session", "reload", agent)[1])
+
+
+def hand_profile(agent, rec, quiet, wait):
+    """Hands rec's profile to the agent and checks the result. Updates rec["profile"] to "ok" or "pending"."""
+    ask_agent(agent, rec["profile_file"], quiet)
+    if not quiet and settle(agent, rec["agent_file"], rec["profile_file"], wait):
+        rec["profile"] = "ok"
+        say(f"Agent file matches the package profile: {rec['agent_file']}")
+        reload_when_free(agent)
+        return True
+    rec["profile"] = "pending"
+    got = read(rec["agent_file"])
+    why = "the agent file is missing" if got is None else first_diff(read(rec["profile_file"]) or "", got)
+    say(f"NOT READY: the agent file of {agent} does not match the package profile yet ({why}).\n"
+        f"  Profile: {rec['profile_file']}\n  Agent file: {rec['agent_file']}\n"
+        f"  When the agent has written it: specialists verify {agent}")
+    return False
+
+
+# --- tools -------------------------------------------------------------------------------------------------------
+
+def hub_tools():
+    """{id: risky?} of the hub catalog, from `hub tools list`."""
+    found = {}
+    for line in hub_run("tools", "list")[1].splitlines():
+        if line.startswith("  ") and line.split() and not line.strip().lower().startswith(RISK):
+            found[line.split()[0]] = any(r in line.lower() for r in RISK)
+    return found
+
+
+def match_tools(wanted, catalog):
+    """By the name before "@": package id -> hub catalog id (exact name first). (found [(id, risky)], not in catalog)."""
+    got, lost = [], []
+    for w in wanted:
+        hits = [k for k in catalog if k == w] or sorted(k for k in catalog if k.split("@")[0] == w)
+        (got if hits else lost).append((hits[0], catalog[hits[0]]) if hits else w)
+    return got, lost
+
+
+def tool_ids(man, mode="all"):
+    tools = man["agent"]["tools"]
+    return [t["id"] for t in tools["need"]] + ([] if mode == "need" else [t["id"] for t in tools["optional"]])
+
+
+def give_tools(agent, wanted):
+    """Asks the hub for tools. `hub tools grant` does not give a risky tool without the owner's yes: a card goes out."""
+    if not wanted:
+        return {"asked": [], "missing": []}
+    got, lost = match_tools(wanted, hub_tools())
+    for tid, risky in got:
+        say(f"  tool {tid}" + (" (risky: waits for the owner's yes)" if risky else "") + ":")
+        say("    " + hub_run("tools", "grant", agent, tid)[1].replace("\n", "\n    "))
+    if lost:
+        say("Not in this hub's catalog (owner: connect them in the hub, then `hub tools grant " + agent + " <id>`): "
+            + ", ".join(lost))
+    return {"asked": [t for t, _ in got], "missing": lost}
+
+
+def plugins_hint(agent, package, repo, names):
+    """The package's own Claude Code plugins: the hub adds them, the plugin does not write hub.json."""
+    if not names:
+        return
+    say(f"The package has its own Claude Code plugins ({', '.join(names)}). To give them to {agent}, the owner adds "
+        f"the package as a Claude Code marketplace ({repo}), then runs `hub tools import set <marketplace>` and "
+        f"`hub tools grant {agent} <plugin>@<marketplace>`.")
+
+
+# --- commands ----------------------------------------------------------------------------------------------------
+
+def who_may(st):
+    """Only the hub or the owner installs (from a working session `hub session new` is just a request to the hub)."""
+    me = os.environ.get("HUB_SESSION")
+    if me and (st["sessions"].get(me) or {}).get("kind") != "hub":
+        die(f"only the hub or the owner installs: ask the hub, hub send hub \"specialists install …\" "
+            f"(session {me} cannot create an agent)")
+
+
+def notify(to, text, quiet):
+    if quiet:
+        say(f"[message to {to}, not sent] {text}")
+    else:
+        code, out = hub_run("send", to, text)
+        say(f"{to}: {out}" if refused(code, out) else f"{to} notified")
+
+
+def find(spec):
+    """A catalog entry or a link of one's own: (package name or None, repo)."""
+    if os.path.isdir(os.path.expanduser(spec)) or re.match(r"^[a-z]+://|^git@|\.git$", spec):
+        return None, spec
+    for item in load_catalog():
+        if item["name"] == spec:
+            return spec, item["repo"]
+    die(f"\"{spec}\" is not in the catalog (specialists list); a folder or a git URL also works")
+
+
+def label(agent, rec):
+    marks = [m for m, on in (("trial", rec.get("trial")), ("profile pending", rec.get("profile") == "pending")) if on]
+    return f"{agent} {rec['version']}" + (f" ({', '.join(marks)})" if marks else "")
+
+
+def cmd_list(_args):
+    st = load_state()["installed"]
+    catalog = load_catalog()
+    say(f"{'specialist':<18} {'catalog':<9} {'installed':<34} repo")
+    for item in catalog:
+        mine = [label(a, v) for a, v in st.items() if v.get("package") == item["name"]]
+        say(f"{item['name']:<18} {item.get('version', '?'):<9} {', '.join(mine) or '-':<34} {item['repo']}")
+    for a, v in st.items():
+        if v.get("package") not in [i["name"] for i in catalog]:
+            say(f"{v.get('package', a):<18} {'-':<9} {label(a, v):<34} {v['repo']}")
+
+
+def wait_session(agent):
+    end, sess = time.time() + WAIT, None
+    while time.time() < end and not sess:
+        sess = hub_status()["sessions"].get(agent)
+        sess = sess if sess and sess.get("session_id") else None
+        if not sess:
+            time.sleep(0.5)
+    if not sess:
+        die(f"the hub did not create session {agent} in {WAIT:.0f} s: the request went out, no agent yet (hub status)")
+    return sess
+
+
+def cmd_install(args):
+    status = hub_status()
+    who_may(status)
+    _, repo = find(args.what)
+    root, tmp = fetch(repo)
+    try:
+        man, bad = check(root, hub_version())
+        if bad:
+            die(f"package {repo} rejected:\n  - " + "\n  - ".join(bad))
+        agent = args.name or man["name"]
+        if not NAME.fullmatch(agent):
+            die(f"bad agent name \"{agent}\": Latin letters, digits, hyphen, up to 40 characters")
+        taken = (status["sessions"].get(agent) or {}).get("state") not in (None, "removed")
+        if taken or agent in load_state()["installed"]:
+            die(f"the name \"{agent}\" is taken. Another one: specialists install {args.what} --name <other>")
+        body = read(os.path.join(root, "CLAUDE.md"))
+        if args.trial:
+            cwd = os.path.abspath(os.path.expanduser(args.cwd or trial_cwd(agent)))
+            path = os.path.join(cwd, "CLAUDE.md")
+            if os.path.exists(path) and not args.cwd:
+                os.remove(path)   # an earlier trial of the same name; in a folder of one's own (--cwd) only the refusal below
+            if os.path.exists(path):
+                die(f"{cwd} already has a CLAUDE.md: a trial goes into an empty folder (another: --cwd)")
+            write(path, fill(body, path, cwd))   # before the session starts: Claude Code reads the folder's CLAUDE.md at start
+            flags = ()
+        else:
+            cwd = os.path.abspath(os.path.expanduser(args.cwd or man["agent"]["cwd"]))
+            os.makedirs(cwd, exist_ok=True)
+            flags = ("--agent",)
+        code, out = hub_run("session", "new", agent, *flags, "--cwd", cwd, "--about", man["description"],
+                            "--icon", man["icon"])
+        say(out)
+        if refused(code, out):
+            die("the hub did not create the " + ("session" if args.trial else "agent"))
+        sess = wait_session(agent)
+        rec = {"package": man["name"], "version": man["version"], "repo": repo, "session_id": sess["session_id"],
+               "cwd": cwd, "tool_ids": tool_ids(man), "plugins": package_plugins(root), "installed_at": int(time.time())}
+        if args.trial:
+            rec.update(agent_file=path, trial=True)
+            say(f"CLAUDE.md of the trial session: {path}")
+        else:
+            rec.update(agent_file=agent_file_path(sess), profile_file=profile_path(agent))
+            write(rec["profile_file"], fill(body, rec["agent_file"], cwd))
+        st = load_state()
+        st["installed"][agent] = rec
+        save_state(st)
+        ok = True if args.trial else hand_profile(agent, rec, args.no_notify, PROFILE_WAIT)
+        plugins_hint(agent, man["name"], repo, rec["plugins"])
+        rec["tools"] = give_tools(agent, [] if args.tools == "none" else tool_ids(man, args.tools))
+        st = load_state()
+        st["installed"][agent] = rec
+        save_state(st)
+        say(f"Installed: {agent} ({man['name']} {man['version']})"
+            + (f", trial: remove with specialists remove {agent}" if args.trial else "")
+            + ("." if ok else f", profile pending: specialists verify {agent}.")
+            + f" Eval cases: {man['agent']['cases']} in the package.")
+    finally:
+        if tmp:
+            rmtree_force(tmp)
+
+
+def cmd_verify(args):
+    status = hub_status()
+    who_may(status)
+    st = load_state()
+    agent, rec = installed(st, args.name)
+    if rec.get("trial") or not rec.get("profile_file"):
+        return say(f"{agent}: nothing to verify (a trial or an adopted agent keeps its own file)")
+    if settle(agent, rec["agent_file"], rec["profile_file"], 0):
+        rec["profile"] = "ok"
+        save_state(st)
+        say(f"{agent}: the agent file matches the package profile")
+        return reload_when_free(agent)
+    rec["profile"] = "pending"
+    save_state(st)
+    got = read(rec["agent_file"])
+    die(f"{agent}: the agent file does not match the package profile "
+        f"({'the agent file is missing' if got is None else first_diff(read(rec['profile_file']) or '', got)}).\n"
+        f"  Profile: {rec['profile_file']}\n  Agent file: {rec['agent_file']}\n"
+        f"  Ask the agent again: hub send {agent} \"replace $HUB_AGENT_FILE with {rec['profile_file']} exactly\"")
+
+
+def cmd_adopt(args):
+    """A live agent installed by hand goes under the catalog: a record like install; its CLAUDE.md and tools stay."""
+    status = hub_status()
+    who_may(status)
+    st = load_state()
+    agent = args.agent
+    sess = status["sessions"].get(agent)
+    if not sess or sess.get("state") == "removed" or not sess.get("session_id"):
+        die(f"no session \"{agent}\" (hub status)")
+    if sess.get("role") != "agent":
+        die(f"\"{agent}\" is not an agent (role: {sess.get('role') or 'none'}): only agents go under the catalog")
+    if agent in st["installed"]:
+        die(f"\"{agent}\" is already installed (specialists list); a new version: specialists update {agent}")
+    path = agent_file_path(sess)
+    if not os.path.isfile(path):
+        die(f"no agent file {path}: nothing to adopt (install it instead: specialists install)")
+    _, repo = find(args.package or agent)
+    root, tmp = fetch(repo)
+    try:
+        man, bad = check(root, hub_version())
+        if bad:
+            die(f"package {repo} rejected:\n  - " + "\n  - ".join(bad))
+        st = load_state()
+        st["installed"][agent] = {"package": man["name"], "version": man["version"], "repo": repo,
+                                  "session_id": sess["session_id"], "agent_file": path,
+                                  "cwd": sess.get("cwd") or os.path.abspath(os.path.expanduser(man["agent"]["cwd"])),
+                                  "tools": {"asked": [], "missing": []},   # a live agent already has its tools
+                                  "tool_ids": tool_ids(man), "plugins": package_plugins(root),
+                                  "installed_at": int(time.time()), "adopted": True}
+        save_state(st)
+        say(f"Agent {agent} is now under the catalog ({man['name']} {man['version']}): its CLAUDE.md is unchanged, new "
+            f"versions: specialists update {agent}. Keep the agent's own lines between {LOCAL_OPEN} and {LOCAL_CLOSE}: "
+            f"update carries them into the new profile.")
+        plugins_hint(agent, man["name"], repo, package_plugins(root))
+    finally:
+        if tmp:
+            rmtree_force(tmp)
+
+
+def installed(st, name):
+    if name in st["installed"]:
+        return name, st["installed"][name]
+    hits = [(a, v) for a, v in st["installed"].items() if v.get("package") == name]
+    if len(hits) == 1:
+        return hits[0]
+    die(f"\"{name}\" is not installed" if not hits else
+        f"\"{name}\" is installed several times ({', '.join(a for a, _ in hits)}): name the agent")
+
+
+def cmd_update(args):
+    status = hub_status()
+    who_may(status)
+    st = load_state()
+    agent, rec = installed(st, args.name)
+    repo = next((i["repo"] for i in load_catalog() if i["name"] == rec["package"]), rec["repo"])
+    root, tmp = fetch(repo)
+    try:
+        man, bad = check(root, hub_version())
+        if bad:
+            die(f"the new version of {repo} is rejected:\n  - " + "\n  - ".join(bad))
+        if man["version"] == rec["version"]:
+            return say(f"{agent}: version {rec['version']} is the latest")
+        path = rec["agent_file"]
+        body, carried = carry_local(fill(read(os.path.join(root, "CLAUDE.md")), path, rec["cwd"]), path)
+        before = rec["version"]
+        if rec.get("trial"):
+            write(path, body)   # a trial's CLAUDE.md lives in the plugin's own folder
+            say(f"{agent}: {before} -> {man['version']}. CLAUDE.md of the trial session rewritten: {path}"
+                + (" (local sections carried over)." if carried else "."))
+            say("  " + hub_run("session", "reload", agent)[1])
+        else:
+            old = read(path)
+            if old is not None:
+                write(profile_path(agent, ".prev"), old)   # the agent file as it was, to roll back by hand
+            rec["profile_file"] = profile_path(agent)
+            write(rec["profile_file"], body)
+            say(f"{agent}: {before} -> {man['version']}. New profile: {rec['profile_file']}"
+                + (f"; the previous agent file: {profile_path(agent, '.prev')}" if old is not None else "")
+                + (". Local sections carried over." if carried else "."))
+            hand_profile(agent, rec, args.no_notify, PROFILE_WAIT)
+        added = [t for t in tool_ids(man) if t not in rec.get("tool_ids", [])]
+        fresh = [p for p in package_plugins(root) if p not in rec.get("plugins", [])]
+        rec.update(version=man["version"], repo=repo, tool_ids=tool_ids(man), plugins=package_plugins(root))
+        save_state(st)
+        plugins_hint(agent, man["name"], repo, fresh)
+        if added:
+            say("New tools of the package:")
+            give_tools(agent, added)
+        say(f"Eval cases of the new version: {man['agent']['cases']} in the package.")
+    finally:
+        if tmp:
+            rmtree_force(tmp)
+
+
+def remove_trial(agent):
+    """A trial session as a whole: put it to sleep (it hands over), wait, remove it from the list. Not allowed (from a
+    working session remove is for the hub or the owner): False, the request to the hub goes from cmd_remove."""
+    state = (hub_status()["sessions"].get(agent) or {}).get("state")
+    if state in (None, "removed"):
+        return True
+    if state not in DOWN:
+        say(hub_run("session", "close", agent)[1])
+        end = time.time() + WAIT
+        while time.time() < end and state not in DOWN:
+            time.sleep(0.5)
+            state = (hub_status()["sessions"].get(agent) or {}).get("state")
+        if state not in DOWN:
+            die(f"{agent} is still handing over (state {state}): the record stays, repeat specialists remove {agent} later")
+    code, out = hub_run("session", "remove", agent)
+    say(out)
+    return not refused(code, out)
+
+
+def cmd_remove(args):
+    st = load_state()
+    agent, rec = installed(st, args.name)
+    removed = remove_trial(agent) if rec.get("trial") else False
+    del st["installed"][agent]
+    save_state(st)
+    for suffix in ("", ".prev"):
+        if os.path.exists(profile_path(agent, suffix)):
+            os.remove(profile_path(agent, suffix))
+    if rec.get("trial") and removed:
+        return say(f"Trial {agent} removed: session and record are gone. The folder and its CLAUDE.md stay: {rec['cwd']}.")
+    me = (hub_status()["sessions"].get(os.environ.get("HUB_SESSION", "")) or {}).get("kind")
+    steps = f"hub session remove {agent} (a trial, already asleep)" if rec.get("trial") else \
+        f"hub session close {agent}, then hub session remove {agent} (to keep it as a plain session: hub session role {agent} worker)"
+    say(f"Record {agent} removed. The agent file stays: {rec['agent_file']}. The hub removes the session: {steps}.")
+    if me != "hub":
+        notify("hub", f"Remove agent {agent} (dropped from the specialists catalog): {steps}", args.no_notify)
+
+
+def main(argv=None):
+    utf8_streams()
+    ap = argparse.ArgumentParser(prog="specialists", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+    p = sub.add_parser("install")
+    p.add_argument("what")
+    p.add_argument("--name")
+    p.add_argument("--cwd")
+    p.add_argument("--tools", choices=("need", "all", "none"), default="all")
+    p.add_argument("--trial", action="store_true",
+                   help="a plain session (not an agent) with CLAUDE.md in its folder; remove takes the session away")
+    p.add_argument("--no-notify", action="store_true", help="print messages to sessions instead of sending them")
+    p.set_defaults(fn=cmd_install)
+    p = sub.add_parser("adopt")
+    p.add_argument("agent")
+    p.add_argument("package", nargs="?", help="a catalog package, folder or git URL (default: the agent's name)")
+    p.set_defaults(fn=cmd_adopt)
+    for name, fn in (("update", cmd_update), ("remove", cmd_remove), ("verify", cmd_verify)):
+        p = sub.add_parser(name)
+        p.add_argument("name")
+        p.add_argument("--no-notify", action="store_true")
+        p.set_defaults(fn=fn)
+    args = ap.parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

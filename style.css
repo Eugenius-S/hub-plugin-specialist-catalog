@@ -1,0 +1,45 @@
+/* the "+" in the header of the "Specialists" group: like the "⋯" next to it, but always visible */
+.sp-plus { width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: 6px; background: none;
+  color: var(--muted-foreground); font-size: calc(17px * var(--ui-scale, 1)); line-height: 1; cursor: pointer; }
+.sp-plus:hover { background: color-mix(in oklch, var(--foreground) 8%, transparent); color: var(--foreground); }
+
+/* the catalog view: heading, 24 before the list, 12 between cards, 16 inside a card */
+.sp-page { max-width: 760px; margin: 0 auto; padding: var(--space-5, 24px) var(--space-4, 16px); }
+.sp-title { margin: 0 0 var(--space-2, 8px); font-size: var(--text-xl, 22px); font-weight: 650; }
+.sp-sub { margin: 0 0 var(--space-4, 16px); color: var(--muted-foreground); font-size: var(--text-sm, 14px); }
+.sp-bar { display: flex; align-items: center; gap: var(--space-3, 12px); margin: 0 0 var(--space-5, 24px); min-height: 28px; }
+.sp-checked { color: var(--muted-foreground); font-size: var(--text-sm, 14px); }
+.sp-checked.sp-err { margin-top: 0; }
+.sp-rows { display: grid; gap: var(--space-3, 12px); }
+.sp-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center; column-gap: var(--space-4, 16px);
+  padding: var(--space-4, 16px); border: 1px solid var(--border); border-radius: var(--radius, 8px); background: var(--card, var(--background)); }
+.sp-icon { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 10px; font-size: 22px;
+  background: color-mix(in oklch, var(--foreground) 6%, transparent); }
+.sp-row[data-state="builtin"] .sp-icon { background: color-mix(in oklch, var(--foreground) 10%, transparent); }
+.sp-top { display: flex; align-items: baseline; gap: var(--space-2, 8px); }
+.sp-name { font-weight: 600; }
+.sp-ver { color: var(--muted-foreground); font: var(--text-xs, 12px) var(--font-mono, monospace); }
+.sp-about { margin-top: var(--space-1, 4px); color: var(--muted-foreground); font-size: var(--text-sm, 14px); line-height: 1.45; }
+.sp-have { color: var(--success, var(--muted-foreground)); font-size: var(--text-sm, 14px); font-weight: 500; white-space: nowrap; }
+.sp-note { color: var(--muted-foreground); font-size: var(--text-sm, 14px); }
+.sp-note:empty { display: none; }
+.sp-act { display: flex; align-items: center; gap: var(--space-2, 8px); justify-content: flex-end; white-space: nowrap; }
+.sp-glyph { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.sp-builtin { display: inline-flex; align-items: center; gap: var(--space-1, 4px); color: var(--muted-foreground); font-size: var(--text-sm, 14px); white-space: nowrap; }
+/* the trash: only a larger icon inside a 44x44 button, easy to hit; a calm hover, like the "+" */
+.sp-del { width: 44px; height: 44px; flex: none; display: inline-grid; place-items: center; padding: 0; border: 0; border-radius: var(--radius, 8px);
+  background: none; color: var(--muted-foreground); cursor: pointer; }
+.sp-del .sp-glyph { width: 22px; height: 22px; }
+.sp-del:hover, .sp-del:focus-visible { background: color-mix(in oklch, var(--foreground) 8%, transparent); color: var(--foreground); }
+.sp-share { min-height: 44px; }
+.sp-badge { align-self: center; padding: 1px var(--space-2, 8px); border: 1px solid var(--border); border-radius: 999px; color: var(--muted-foreground);
+  font-size: var(--text-xs, 12px); white-space: nowrap; }
+.sp-row[data-local="1"] { border-style: dashed; }
+/* the confirmation: across the card, under the row */
+.sp-confirm { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--space-4, 16px); margin-top: var(--space-4, 16px);
+  padding-top: var(--space-4, 16px); border-top: 1px solid var(--border); }
+.sp-confirm-text { flex: 1 1 auto; min-width: 0; }
+.sp-confirm-btns { display: flex; gap: var(--space-2, 8px); flex: none; }
+.sp-sure { color: var(--foreground); font-size: var(--text-sm, 14px); font-weight: 600; }
+.sp-confirm-note { margin-top: var(--space-1, 4px); color: var(--muted-foreground); font-size: var(--text-sm, 14px); }
+.sp-err { margin-top: var(--space-1, 4px); color: var(--destructive); font-size: var(--text-xs, 12px); }
