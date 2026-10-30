@@ -205,6 +205,12 @@ def pinned(name):
     return next((str(i.get("commit") or "") for i in load_catalog() if i["name"] == name), "") if name else ""
 
 
+def same_repo(a, b):
+    """Two addresses of one repo (a trailing slash or .git aside)."""
+    norm = lambda u: (u or "").strip().rstrip("/").removesuffix(".git").lower()
+    return bool(a) and norm(a) == norm(b)
+
+
 def text_files(root):
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules")]
@@ -705,8 +711,11 @@ def cmd_update(args):
     who_may(status)
     st = load_state()
     agent, rec = installed(st, args.name)
-    repo = next((i["repo"] for i in load_catalog() if i["name"] == rec["package"]), rec["repo"])
-    pin = pinned(rec["package"])
+    # the address recorded at install wins: a hub that installed a package from its own repo stays on it even when the
+    # catalog lists a package of that name elsewhere; the catalog's pin applies only to the catalog's own address
+    listed = next((i["repo"] for i in load_catalog() if i["name"] == rec["package"]), "")
+    repo = rec.get("repo") or listed
+    pin = pinned(rec["package"]) if same_repo(repo, listed) else ""
     root, tmp = fetch(repo, pin)
     try:
         man, bad = check(root, hub_version())

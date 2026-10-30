@@ -2,6 +2,6 @@
   "name": "hub-plugin-specialists",
   "owner": {"name": "Eugenius-S"},
   "plugins": [
-    {"name": "specialists", "source": "./plugins/specialists", "description": "Hub specialists catalog: ready-made agents as packages: specialists list | install | verify | update | remove.", "version": "0.10.0"}
+    {"name": "specialists", "source": "./plugins/specialists", "description": "Hub specialists catalog: ready-made agents as packages: specialists list | install | verify | update | remove.", "version": "0.11.0"}
   ]
 }

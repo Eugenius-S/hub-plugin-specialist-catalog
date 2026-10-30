@@ -3,7 +3,7 @@
   "icon": "icon.png",
   "description": "Ready-made agents from a catalog: press Install and the hub sets up the specialist, hands it its profile, checks the result and asks for the tools it needs. An update keeps your local notes in the agent's file. The catalog is in the ☰ menu.",
   "why": "Install a ready-made specialist with one command instead of building your own: the package is checked, the agent is set up, the tools are requested",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "hub": "^1.15",
   "skills": true,
   "web": "main.js",

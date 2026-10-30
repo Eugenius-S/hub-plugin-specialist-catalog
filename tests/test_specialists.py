@@ -509,6 +509,17 @@ class Pinned(Base):
         self.assertIn("is the latest", out)
         self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.1.0")
 
+    def test_update_keeps_the_address_recorded_at_install(self):
+        self.pin(self.first)
+        self.install()
+        other = os.path.join(self.tmp, "public-analyst")   # the catalog now lists the package elsewhere, with its own pin
+        with open(sp.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "analyst", "repo": other, "version": "0.9.0", "commit": "1" * 40}], f)
+        out = self.run_cli("update", "analyst")   # the recorded repo, its head: no pin of another address applies
+        self.assertNotIn("is the latest", out)
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["repo"], rec["commit"], rec["version"]), (self.pkg, self.second, "0.2.0"))
+
     def test_adopt_records_the_pinned_commit(self):
         self.pin(self.first)
         self.hub.sessions["designer"] = {"state": "idle", "session_id": "sid-designer", "kind": "work", "role": "agent"}
@@ -725,13 +736,13 @@ class Process(unittest.TestCase):
         self.assertFalse(rows["analyst"]["update"])
         self.assertTrue(rows["writer"]["update"])
 
-    def test_catalog_address_wins_over_the_recorded_one(self):
+    def test_recorded_address_wins_over_the_catalog_one(self):
         with open(proc.CATALOG, "w", encoding="utf-8") as f:
-            json.dump([{"name": "analyst", "repo": "https://example.invalid/moved"}], f)
+            json.dump([{"name": "analyst", "repo": "https://example.invalid/moved", "commit": "1" * 40}], f)
         seen = []
-        proc.check_all(now=1, probe=lambda repo, commit="": seen.append(repo) or ("0.1.0", ""))
-        self.assertIn("https://example.invalid/moved", seen)
-        self.assertIn("https://example.invalid/writer", seen)
+        proc.check_all(now=1, probe=lambda repo, commit="": seen.append((repo, commit)) or ("0.1.0", ""))
+        self.assertIn(("https://example.invalid/analyst", ""), seen)   # the catalog's pin is for its own address only
+        self.assertNotIn("https://example.invalid/moved", [r for r, _ in seen])
 
     def test_installed_version_follows_state_without_a_new_check(self):
         proc.check_all(now=1, probe=lambda repo, commit="": ("0.2.0", ""))

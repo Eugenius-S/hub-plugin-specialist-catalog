@@ -34,6 +34,10 @@ usual.
 keeps between `<!-- specialists:local -->` and `<!-- /specialists:local -->`: update carries this section into the new
 profile, so the agent gets one whole file to put in place.
 
+**Which repo update follows.** The address recorded at install: a hub that installed a package from its own repo
+stays on it even when the catalog lists a package of that name elsewhere. The catalog's pinned commit applies only to
+the catalog's own address; an agent on another address gets its repo head.
+
 **--trial** is a trial install (try a specialist and remove it without the owner): instead of an agent, a plain session is
 created (`hub session new` without `--agent`, role worker), and the package's `CLAUDE.md` is put into its folder,
 `<hub state>/specialists/trial/<name>` or `--cwd` (someone else's `CLAUDE.md` there is a refusal). **remove** of a trial

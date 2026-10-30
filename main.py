@@ -55,12 +55,28 @@ def installed():
     return {a: v for a, v in (got or {}).items() if isinstance(v, dict) and v.get("version")}
 
 
-def catalog_repo(package, rec):
-    """As `specialists update`: the catalog's address wins, then the one recorded at install."""
+def listed_repo(package):
+    """The catalog's address of a package ("" when the catalog does not list it)."""
     for item in read_json(CATALOG, []):
         if isinstance(item, dict) and item.get("name") == package and item.get("repo"):
             return item["repo"]
-    return rec.get("repo") or ""
+    return ""
+
+
+def same_repo(a, b):
+    """Two addresses of one repo (a trailing slash or .git aside)."""
+    norm = lambda u: (u or "").strip().rstrip("/").removesuffix(".git").lower()
+    return bool(a) and norm(a) == norm(b)
+
+
+def catalog_repo(package, rec):
+    """As `specialists update`: the address recorded at install wins, then the catalog's."""
+    return rec.get("repo") or listed_repo(package)
+
+
+def pin_for(package, rec):
+    """The catalog's pin, only when the agent follows the catalog's own address ("" otherwise)."""
+    return catalog_commit(package) if same_repo(catalog_repo(package, rec), listed_repo(package)) else ""
 
 
 def catalog_commit(package):
@@ -213,11 +229,11 @@ def check_all(now=None, probe=latest_version, diff=changes_of):
     got, seen = {}, {}
 
     def one(package, rec):
-        version, err = probe(catalog_repo(package, rec), catalog_commit(package))
+        version, err = probe(catalog_repo(package, rec), pin_for(package, rec))
         got[package] = {"version": version, "error": err}
 
     def preview(agent, rec):
-        pin = catalog_commit(rec.get("package") or "")
+        pin = pin_for(rec.get("package") or "", rec)
         if pin and rec.get("commit") and rec["commit"] != pin:
             seen[agent] = diff(catalog_repo(rec["package"], rec), pin, rec)
 
@@ -241,7 +257,7 @@ def build(req=""):
     for agent, rec in installed().items():
         a = answers.get(rec.get("package") or "") or {}
         latest = a.get("version") or ""
-        pin = catalog_commit(rec.get("package") or "")
+        pin = pin_for(rec.get("package") or "", rec)
         moved = bool(pin and rec.get("commit") and rec["commit"] != pin)   # same version, another commit: still an update
         ch = (seen.get("changes") or {}).get(agent)
         rows[agent] = {"package": rec.get("package") or agent, "installed": rec["version"], "latest": latest,
