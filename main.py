@@ -26,6 +26,8 @@ STATUS = os.environ.get("SPECIALISTS_STATUS") or os.path.join(HERE, "status.json
 EVERY = 2          # s: how often the channel and state.json are looked at
 CLONE_WAIT = 90    # s: one package; a slower repo is a reason, not a hang
 TOKEN = re.compile(r"check\s+([A-Za-z0-9._-]{1,64})")
+SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+DIFF_LINES = 40    # lines of the profile change the page shows; the rest is "and N more"
 
 
 def read_json(path, default):
@@ -61,6 +63,15 @@ def catalog_repo(package, rec):
     return rec.get("repo") or ""
 
 
+def catalog_commit(package):
+    """The full sha the catalog pins the package to ("" = not pinned), as `specialists update` reads it."""
+    for item in read_json(CATALOG, []):
+        if isinstance(item, dict) and item.get("name") == package:
+            c = str(item.get("commit") or "")
+            return c if SHA.fullmatch(c) else ""
+    return ""
+
+
 def version_key(v):
     return tuple(int(x) for x in re.findall(r"\d+", str(v)))
 
@@ -73,26 +84,110 @@ def newer(latest, have):
     return a > b if a and b else True
 
 
-def latest_version(repo):
-    """(version, '') or ('', reason): the manifest's version in the repo's last commit, without the package's files."""
+def git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=CLONE_WAIT, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+
+
+def source(repo):
+    """(address for git, plain): a local folder without .git is read as it is."""
     local = os.path.expanduser(repo)
-    if os.path.isdir(local) and not os.path.isdir(os.path.join(local, ".git")):
-        return manifest_version(os.path.join(local, "hub-plugin.json"))
+    if os.path.isdir(local):
+        return os.path.abspath(local), not os.path.isdir(os.path.join(local, ".git"))
+    return repo, False
+
+
+def fetch_commit(src, commit, to):
+    """The commit by itself into `to` (shallow; a server that refuses a bare sha gets all branches). "" or the reason."""
+    out = git("init", "-q", to)
+    if out.returncode:
+        return (out.stderr.strip().splitlines() or ["git init failed"])[-1][:200]
+    for cmd in (("fetch", "-q", "--depth", "1", "--no-tags", "--", src, commit),
+                ("fetch", "-q", "--no-tags", "--", src, "+refs/heads/*:refs/remotes/origin/*")):
+        out = git("-C", to, *cmd)
+        if not out.returncode and not git("-C", to, "cat-file", "-e", commit + "^{commit}").returncode:
+            return ""
+    return (out.stderr.strip().splitlines() or [f"the commit {commit[:12]} is not in the repo"])[-1][:200]
+
+
+def latest_version(repo, commit=""):
+    """(version, '') or ('', reason): the manifest's version in the pinned commit, else in the repo's last commit,
+    without the package's other files."""
+    src, plain = source(repo)
+    if plain:
+        return ("", "a pinned package must be a git repo") if commit else manifest_version(os.path.join(src, "hub-plugin.json"))
     tmp = tempfile.mkdtemp(prefix="specialists-check-")
     try:
-        src = os.path.abspath(local) if os.path.isdir(local) else repo
-        out = subprocess.run(["git", "clone", "-q", "--depth", "1", "--filter=blob:none", "--no-checkout", src, tmp + "/r"],
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=CLONE_WAIT,
-                             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-        if out.returncode:
-            return "", (out.stderr.strip().splitlines() or ["git clone failed"])[-1][:200]
-        show = subprocess.run(["git", "-C", tmp + "/r", "show", "HEAD:hub-plugin.json"], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=CLONE_WAIT)
+        if commit:
+            why = fetch_commit(src, commit, tmp + "/r")
+            if why:
+                return "", why
+            ref = commit
+        else:
+            out = git("clone", "-q", "--depth", "1", "--filter=blob:none", "--no-checkout", "--", src, tmp + "/r")
+            if out.returncode:
+                return "", (out.stderr.strip().splitlines() or ["git clone failed"])[-1][:200]
+            ref = "HEAD"
+        show = git("-C", tmp + "/r", "show", f"{ref}:hub-plugin.json")
         if show.returncode:
             return "", "no hub-plugin.json in the package"
         return manifest_version(None, show.stdout)
     except (OSError, subprocess.SubprocessError) as e:
         return "", str(e)[:200] or e.__class__.__name__
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def plugin_names(text):
+    """Names of the package's own plugins in its .claude-plugin/marketplace.json, as the CLI reads them."""
+    try:
+        market = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    return [p["name"] for p in (market.get("plugins") if isinstance(market, dict) else None) or []
+            if isinstance(p, dict) and isinstance(p.get("name"), str) and isinstance(p.get("source"), str)]
+
+
+def tool_names(text):
+    try:
+        tools = json.loads(text)["agent"]["tools"]
+        return [t["id"] for k in ("need", "optional") for t in tools[k] if isinstance(t, dict) and t.get("id")]
+    except (ValueError, TypeError, KeyError):
+        return []
+
+
+def changes_of(repo, commit, rec):
+    """What `specialists update` changes in the profile: CLAUDE.md lines, tools, plugins; None when it cannot be told.
+    The installed commit is the base; a record without one has no profile diff, only the new side."""
+    src, plain = source(repo)
+    if plain or not commit:
+        return None
+    base = rec.get("commit") or ""
+    tmp = tempfile.mkdtemp(prefix="specialists-diff-")
+    try:
+        if fetch_commit(src, commit, tmp + "/r"):
+            return None
+        at = lambda ref, path: (lambda o: o.stdout if not o.returncode else "")(git("-C", tmp + "/r", "show", f"{ref}:{path}"))
+        tools = tool_names(at(commit, "hub-plugin.json"))
+        plugins = plugin_names(at(commit, ".claude-plugin/marketplace.json"))
+        out = {"base": base, "to": commit,
+               "tools": {"added": [t for t in tools if t not in (rec.get("tool_ids") or [])],
+                         "removed": [t for t in (rec.get("tool_ids") or []) if t not in tools]},
+               "plugins": {"added": [p for p in plugins if p not in (rec.get("plugins") or [])],
+                           "removed": [p for p in (rec.get("plugins") or []) if p not in plugins]}}
+        have = bool(base) and not git("-C", tmp + "/r", "fetch", "-q", "--depth", "1", "--no-tags", "--", src, base).returncode
+        if have:
+            d = git("-C", tmp + "/r", "diff", "--no-color", "--unified=0", base, commit, "--", "CLAUDE.md").stdout
+            lines = [l[:200] for l in d.splitlines() if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+            out["profile"] = {"known": True, "added": sum(l[0] == "+" for l in lines),
+                              "removed": sum(l[0] == "-" for l in lines), "lines": lines[:DIFF_LINES],
+                              "more": max(0, len(lines) - DIFF_LINES)}
+        else:
+            out["profile"] = {"known": False, "added": len(at(commit, "CLAUDE.md").splitlines()), "removed": 0,
+                              "lines": [], "more": 0}
+        return out
+    except (OSError, subprocess.SubprocessError):
+        return None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -108,26 +203,34 @@ def manifest_version(path, text=None):
     return (v, "") if v else ("", "no version in hub-plugin.json")
 
 
-def check_all(now=None, probe=latest_version):
-    """Ask every installed package once (in parallel); the answers go to latest.json."""
+def check_all(now=None, probe=latest_version, diff=changes_of):
+    """Ask every installed package once (in parallel); the answers go to latest.json. A package the catalog pins to a
+    commit is asked at that commit, and every agent behind it gets the preview of what its update changes."""
     packages = {}
     for rec in installed().values():
         packages.setdefault(rec.get("package") or "", rec)
     packages.pop("", None)
-    got = {}
+    got, seen = {}, {}
 
     def one(package, rec):
-        version, err = probe(catalog_repo(package, rec))
+        version, err = probe(catalog_repo(package, rec), catalog_commit(package))
         got[package] = {"version": version, "error": err}
 
+    def preview(agent, rec):
+        pin = catalog_commit(rec.get("package") or "")
+        if pin and rec.get("commit") and rec["commit"] != pin:
+            seen[agent] = diff(catalog_repo(rec["package"], rec), pin, rec)
+
     threads = [threading.Thread(target=one, args=(p, r), daemon=True) for p, r in packages.items()]
+    threads += [threading.Thread(target=preview, args=(a, r), daemon=True) for a, r in installed().items()]
     for t in threads:
         t.start()
     for t in threads:
         t.join(CLONE_WAIT * 2 + 10)
     for package in packages:
         got.setdefault(package, {"version": "", "error": "timeout"})
-    write_json(state_file("latest.json"), {"at": now or time.time(), "packages": got})
+    write_json(state_file("latest.json"), {"at": now or time.time(), "packages": got,
+                                           "changes": {a: c for a, c in seen.items() if c}})
 
 
 def build(req=""):
@@ -138,8 +241,14 @@ def build(req=""):
     for agent, rec in installed().items():
         a = answers.get(rec.get("package") or "") or {}
         latest = a.get("version") or ""
+        pin = catalog_commit(rec.get("package") or "")
+        moved = bool(pin and rec.get("commit") and rec["commit"] != pin)   # same version, another commit: still an update
+        ch = (seen.get("changes") or {}).get(agent)
         rows[agent] = {"package": rec.get("package") or agent, "installed": rec["version"], "latest": latest,
-                       "update": newer(latest, rec["version"]), "error": a.get("error") or ""}
+                       "update": newer(latest, rec["version"]) or (moved and not a.get("error")),
+                       "error": a.get("error") or ""}
+        if isinstance(ch, dict) and ch.get("base") == rec.get("commit") and ch.get("to") == pin:   # not a stale preview
+            rows[agent]["changes"] = ch
     return {"checked_at": seen.get("at") or 0, "req": req, "rows": rows}
 
 

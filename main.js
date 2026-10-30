@@ -1,5 +1,5 @@
-// The specialists catalog on the hub page: the "+" in the header of the "Specialists" group (slot sidebar.group) opens
-// the view #/x/specialists: packages from specialists.json (name, what it does, version) and the hub's built-in agents
+// The specialists catalog on the hub page: the view #/x/specialists (in the ☰ menu; a hub that has the slot sidebar.group
+// also gets a "+" in the header of the "Specialists" group that opens it): packages from specialists.json (name, what it does, version) and the hub's built-in agents
 // (system agents every hub has out of the box; the core names them: session.system in the snapshot). Installed means
 // an agent with that name exists in the hub; otherwise "Install" asks the hub to run `specialists install <name>` (only
 // the hub or the owner installs, never the page).
@@ -10,7 +10,8 @@
 // remove` does not remove such an agent).
 // "Check for updates" on top asks the plugin process (main.py): it compares the installed version of every package
 // with the latest one in its repo and writes status.json; a newer one turns "✓ Installed" into "Update" (a request to
-// the hub: `specialists update <name>`, like "Install").
+// the hub: `specialists update <name>`, like "Install"), but only after the owner confirms on the card what changes in the
+// profile (CLAUDE.md of the package, tools, plugins): the plugin process works that out and puts it in status.json.
 const ID = "specialists";
 const ASK_TTL = 30 * 60 * 1000;   // "asked the hub to install" lasts this long, then "Install" again
 const DROP_TTL = 10 * 60 * 1000;  // "asked the hub to remove": the agent still there after this long, the card says it failed
@@ -21,6 +22,7 @@ const UPD_TTL = 10 * 60 * 1000;
 const CHECK_WAIT = 200 * 1000;   // the plugin process silent longer: the check "did not answer"
 const SHARE_TTL = 6 * 60 * 60 * 1000;   // "share" sent: the button rests this long, then it can be pressed again
 const STORE_SHARE = "specialists:sharing";
+const GROUP_SLOT = "sidebar.group";   // not in every hub: the "+" is drawn only where the page has this slot
 const POLL = 2000;
 
 // plugin strings: the language is the page's (hub.lang); a missing language falls back to English
@@ -52,6 +54,13 @@ const STR = {
     check_silent: "The plugin process did not answer in {min} min. Restart the plugin and try again.",
     update: "Update", update_title: "To the hub: specialists update {name}", update_wait_title: "The hub is updating it; the card goes back to “Installed”",
     update_refused: "The hub did not take the request: {err}", row_failed: "Could not check the version: {err}",
+    upd_sure: "Update {name} to {to}?", upd_yes: "Update",
+    upd_note: "The hub will replace the profile with the new package version. Nothing changes before you confirm.",
+    upd_unknown: "The plugin could not work out what changes in the profile. It is the package version {to}.",
+    upd_profile: "CLAUDE.md: {added} lines added, {removed} removed", upd_profile_new: "CLAUDE.md: a new profile in the package",
+    upd_profile_same: "CLAUDE.md: no changes",
+    upd_more: "…and {n} more lines", upd_tools_add: "Tools added: {list}", upd_tools_del: "Tools removed: {list}",
+    upd_plugins_add: "Plugins added: {list}", upd_plugins_del: "Plugins removed: {list}",
   },
   ru: {
     title: "Каталог специалистов", subtitle: "готовые агенты одной командой", plus: "Каталог специалистов",
@@ -80,6 +89,13 @@ const STR = {
     check_silent: "Процесс плагина не ответил за {min} мин. Перезапусти плагин и повтори.",
     update: "Обновить", update_title: "Хабу: specialists update {name}", update_wait_title: "Хаб обновляет; карточка вернётся к «Поставлен»",
     update_refused: "Хаб не принял просьбу: {err}", row_failed: "Не удалось узнать версию: {err}",
+    upd_sure: "Обновить {name} до {to}?", upd_yes: "Обновить",
+    upd_note: "Хаб заменит профиль на новую версию пакета. Пока не подтвердишь, ничего не меняется.",
+    upd_unknown: "Плагин не смог выяснить, что меняется в профиле. Это версия пакета {to}.",
+    upd_profile: "CLAUDE.md: добавлено строк {added}, убрано {removed}", upd_profile_new: "CLAUDE.md: в пакете новый профиль",
+    upd_profile_same: "CLAUDE.md: без изменений",
+    upd_more: "…и ещё строк: {n}", upd_tools_add: "Инструменты добавлены: {list}", upd_tools_del: "Инструменты убраны: {list}",
+    upd_plugins_add: "Плагины добавлены: {list}", upd_plugins_del: "Плагины убраны: {list}",
   },
 };
 export function tr(key, vars = {}, lang = hub && hub.lang) {
@@ -96,6 +112,7 @@ let sig = "";
 let shown = null;   // view root: hub.redraw redraws the list, not the view; after loading and button clicks we draw ourselves
 let sure = "";      // which card shows "Remove?"
 let sureShare = ""; // which card shows "Share?"
+let sureUpdate = ""; // which card shows "Update?" with what changes
 const errors = {};  // name -> a ready string about the hub's refusal on the card
 let status = null;  // the process's status.json: {checked_at, req, rows: {agent: {installed, latest, update, error}}}
 let checking = "";  // token of the running check; empty: none running
@@ -161,7 +178,27 @@ export function updateOf(name, st, upd = {}, now = Date.now()) {
   const r = st && st.rows && Object.hasOwn(st.rows, name) ? st.rows[name] : null;
   if (!r || !r.update) return null;
   const at = upd[`${name}@${r.installed}`];
-  return { from: r.installed, to: r.latest, wait: !!at && now - at < UPD_TTL };
+  return { from: r.installed, to: r.latest, wait: !!at && now - at < UPD_TTL, changes: r.changes || null };
+}
+
+// what the owner confirms before "Update": a list of ready lines (a diff of CLAUDE.md goes apart, in `diff`);
+// no data from the process: one line saying so, the update is still the owner's decision
+export function changeLines(changes, to = "") {
+  const c = changes && typeof changes === "object" ? changes : null;
+  if (!c || !c.profile) return { lines: [tr("upd_unknown", { to })], diff: [] };
+  const p = c.profile, lines = [];
+  if (!p.known) lines.push(tr("upd_profile_new"));
+  else if (!p.added && !p.removed) lines.push(tr("upd_profile_same"));
+  else lines.push(tr("upd_profile", { added: p.added, removed: p.removed }));
+  const list = (o, add, del) => {
+    if (o && o.added && o.added.length) lines.push(tr(add, { list: o.added.join(", ") }));
+    if (o && o.removed && o.removed.length) lines.push(tr(del, { list: o.removed.join(", ") }));
+  };
+  list(c.tools, "upd_tools_add", "upd_tools_del");
+  list(c.plugins, "upd_plugins_add", "upd_plugins_del");
+  const diff = Array.isArray(p.lines) ? p.lines.map(String) : [];
+  if (p.more) diff.push(tr("upd_more", { n: p.more }));
+  return { lines, diff };
 }
 
 // the check result from status.json: what to show next to the button
@@ -198,21 +235,37 @@ export default function register(h) {
   hub = h;
   hub.addStyle("style.css");
   hub.addView({ id: ID, title: tr("title"), subtitle: tr("subtitle"), icon: "icon.svg", render, show: show });
-  // "+" at "Specialists" (slot sidebar.group is a hub addition; on a hub without it the catalog is in the ☰ menu)
-  hub.addSlot("sidebar.group", {
+  plus(hub, SLOTS);
+}
+
+// the "+" in the header of the "Specialists" group: the slot is a hub addition, a hub without it would show a plugin
+// error for an unknown slot, so the slot is taken only when the page lists it; none: the view in the ☰ menu is enough
+export function plus(h, slots) {
+  if (!Array.isArray(slots) || !slots.includes(GROUP_SLOT)) return false;
+  h.addSlot(GROUP_SLOT, {
     id: "catalog",
     render(root, snap, ctx) {
       if (ctx.group !== "agents") return root.replaceChildren();
       if (root.firstChild) return;
-      const b = hub.el("button", "sp-plus", "+");
+      const b = h.el("button", "sp-plus", "+");
       b.type = "button";
       b.title = tr("plus");
       b.setAttribute("aria-label", tr("plus"));
-      b.addEventListener("click", (e) => { e.stopPropagation(); hub.go(ID); });
+      b.addEventListener("click", (e) => { e.stopPropagation(); h.go(ID); });
       root.append(b);
     },
   });
+  return true;
 }
+
+// the slots the page knows: its own list (ext.js exports it); no list (another page, a test): none
+export async function slotNames(load = () => import("/static/js/ext.js")) {
+  try {
+    const m = await load();
+    return m && m.SLOTS && typeof m.SLOTS === "object" ? Object.keys(m.SLOTS) : [];
+  } catch { return []; }
+}
+const SLOTS = await slotNames();
 
 function show() {
   load();
@@ -312,7 +365,7 @@ function render(root, snap) {
   const local = unlisted(sessions, (list || []).map((p) => p.name)).map((p) => ({ ...p, local: true,
     state: stateOf(p.name, sessions, {}, now, drop), shared: !!shared[p.name] && now - shared[p.name] < SHARE_TTL }));
   rows.push(...local, ...mine);
-  const next = JSON.stringify([sure, sureShare, errors, rows, checking, result]);
+  const next = JSON.stringify([sure, sureShare, sureUpdate, errors, rows, checking, result]);
   if (next === sig) return;
   sig = next;
   bar();
@@ -368,13 +421,17 @@ function row(p) {
     } else if (sureShare === p.name) {
       confirm = ask(tr("share_sure", { name: p.name }), tr("share_note", { name: p.name }), "primary sp-yes sp-share-yes", tr("share_yes"),
         (yes) => share(p.name, yes), () => { sureShare = ""; sig = ""; repaint(); });
+    } else if (sureUpdate === p.name && p.upd && !p.upd.wait) {
+      const ch = changeLines(p.upd.changes, p.upd.to);
+      confirm = ask(tr("upd_sure", { name: p.name, to: p.upd.to }), tr("upd_note"), "primary sp-yes sp-upd-yes", tr("upd_yes"),
+        (yes) => update(p.name, p.upd.from, yes), () => { sureUpdate = ""; sig = ""; repaint(); }, ch);
     } else {
       if (p.upd) {
         const u = hub.el("button", "btn small" + (p.upd.wait ? "" : " primary") + " sp-upd", p.upd.wait ? tr("asked") : tr("update"));
         u.type = "button";
         u.disabled = p.upd.wait;
         u.title = p.upd.wait ? tr("update_wait_title") : tr("update_title", { name: p.name });
-        u.addEventListener("click", () => update(p.name, p.upd.from, u));
+        u.addEventListener("click", () => { sureUpdate = p.name; sure = sureShare = ""; delete errors[p.name]; sig = ""; repaint(); });
         act.append(u);
       } else if (p.state === "have" && !p.local) act.append(hub.el("span", "sp-have", tr("have")));
       if (p.local) {
@@ -382,7 +439,7 @@ function row(p) {
         sh.type = "button";
         sh.disabled = p.shared;
         sh.title = p.shared ? tr("shared_title", { name: p.name }) : tr("share_title", { name: p.name });
-        sh.addEventListener("click", () => { sureShare = p.name; sure = ""; delete errors[p.name]; sig = ""; repaint(); });
+        sh.addEventListener("click", () => { sureShare = p.name; sure = sureUpdate = ""; delete errors[p.name]; sig = ""; repaint(); });
         act.append(sh);
       }
       act.append(trash(p.name));
@@ -413,15 +470,19 @@ function trash(name) {
   del.title = tr("remove_title", { name });
   del.setAttribute("aria-label", tr("remove_title", { name }));
   del.append(glyph("trash"));
-  del.addEventListener("click", () => { sure = name; sureShare = ""; delete errors[name]; sig = ""; repaint(); });
+  del.addEventListener("click", () => { sure = name; sureShare = sureUpdate = ""; delete errors[name]; sig = ""; repaint(); });
   return del;
 }
 
 // a confirmation across the card: the question, what exactly happens, two buttons
-function ask(question, note, yesClass, yesText, onYes, onNo) {
+function ask(question, note, yesClass, yesText, onYes, onNo, extra = null) {
   const box = hub.el("div", "sp-confirm");
   const text = hub.el("div", "sp-confirm-text");
   text.append(hub.el("div", "sp-sure", question), hub.el("div", "sp-confirm-note", note));
+  if (extra) {
+    for (const l of extra.lines) text.append(hub.el("div", "sp-confirm-note", l));
+    if (extra.diff.length) text.append(hub.el("pre", "sp-diff", extra.diff.join("\n")));
+  }
   const yes = hub.el("button", "btn small " + yesClass, yesText);
   const no = hub.el("button", "btn small sp-no", tr("sure_no"));
   yes.type = no.type = "button";
@@ -478,6 +539,7 @@ async function share(name, b) {
 
 async function update(name, from, b) {
   b.disabled = true;
+  sureUpdate = "";
   delete errors[name];
   const res = await hub.post("/api/send", { session: hubName((hub.snapshot() || {}).sessions), text: updateText(name), action: true });
   if (res && res.error) {

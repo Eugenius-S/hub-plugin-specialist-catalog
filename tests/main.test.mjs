@@ -189,7 +189,7 @@ const row = (installed, latest, extra = {}) => ({ package: "x", installed, lates
 
 test("updateOf: only for a lagging version; a recent request means wait, a changed version means clean again", () => {
   const st = { rows: { analyst: row("0.1.2", "0.2.0"), writer: row("0.1.0", "0.1.0") } };
-  assert.deepEqual(mod.updateOf("analyst", st, {}, 1e9), { from: "0.1.2", to: "0.2.0", wait: false });
+  assert.deepEqual(mod.updateOf("analyst", st, {}, 1e9), { from: "0.1.2", to: "0.2.0", wait: false, changes: null });
   assert.equal(mod.updateOf("writer", st, {}, 1e9), null);
   assert.equal(mod.updateOf("nobody", st, {}, 1e9), null);
   assert.equal(mod.updateOf("analyst", null, {}, 1e9), null);
@@ -240,8 +240,12 @@ test("top button: the check sends a request to the process, finds a newer one, U
   assert.match(c.analyst.text(), /v0\.1\.2 → v0\.2\.0/);
   assert.match(c.writer.text(), /✓ Поставлен/);
   assert.equal(button(c.writer, "sp-upd"), undefined);
-  // Update is a request to the hub, like Install
+  // Update asks the owner first and only then goes to the hub as a request, like Install
+  sent.length = 0;
   await upd.click();
+  assert.equal(sent.length, 0, "the first press only asks");
+  assert.ok(button(cards().analyst, "sp-upd-yes"), "the card asks to confirm");
+  await button(cards().analyst, "sp-upd-yes").click();
   assert.deepEqual(sent.at(-1), ["/api/send", { session: "hub", text: mod.updateText("analyst"), action: true }]);
   assert.match(mod.updateText("analyst"), /specialists update analyst/);
   const asked = button(cards().analyst, "sp-upd");
@@ -271,6 +275,7 @@ test("nothing new gives All latest; hub refusal on Update shows as a line on the
   await draw();
   hub.reply = { error: "hub busy" };
   await button(cards().analyst, "sp-upd").click();
+  await button(cards().analyst, "sp-upd-yes").click();
   assert.match(cards().analyst.text(), /Хаб не принял просьбу: hub busy/);
   assert.equal(button(cards().analyst, "sp-upd").disabled, false, "can be pressed again");
   hub.reply = { ok: true };
@@ -432,4 +437,100 @@ test("English page: Not-in-the-catalog and Share", async () => {
   assert.equal(button(cards()["my-agent"], "sp-share").text(), "Share");
   assert.equal(button(cards()["my-agent"], "sp-del").title, "Remove my-agent");
   hub.lang = "ru";
+});
+
+test("no group slot in the page: plus() does nothing and does not throw; with the slot it is taken once", () => {
+  const calls = [];
+  const bare = { ...hub, addSlot: () => { throw new Error("no such slot"); } };
+  assert.equal(mod.plus(bare, []), false);
+  assert.equal(mod.plus(bare, undefined), false);
+  assert.equal(mod.plus(bare, ["composer.tools"]), false);
+  const withSlot = { ...hub, addSlot: (name, spec) => calls.push([name, spec.id]) };
+  assert.equal(mod.plus(withSlot, ["sidebar.group", "composer.tools"]), true);
+  assert.deepEqual(calls, [["sidebar.group", "catalog"]]);
+});
+
+test("slotNames: the page slots by name; an import that fails gives an empty list instead of an exception", async () => {
+  assert.deepEqual(await mod.slotNames(async () => ({ SLOTS: { "composer.tools": {}, "sidebar.group": {} } })), ["composer.tools", "sidebar.group"]);
+  assert.deepEqual(await mod.slotNames(async () => ({ SLOTS: { "composer.tools": {} } })), ["composer.tools"]);
+  assert.deepEqual(await mod.slotNames(async () => { throw new Error("no ext.js"); }), []);
+  assert.deepEqual(await mod.slotNames(async () => ({})), []);
+  assert.deepEqual(await mod.slotNames(async () => null), []);
+});
+
+test("changeLines: no data from the process; new profile; no changes; added and removed lines, tools, plugins, the cut tail", () => {
+  hub.lang = "ru";
+  const none = mod.changeLines(null, "0.2.0");
+  assert.equal(none.lines.length, 1);
+  assert.match(none.lines[0], /не смог выяснить/);
+  assert.deepEqual(none.diff, []);
+  assert.match(mod.changeLines({}, "0.2.0").lines[0], /не смог выяснить/);
+  assert.match(mod.changeLines({ profile: { known: false } }).lines[0], /новый профиль/);
+  assert.match(mod.changeLines({ profile: { known: true, added: 0, removed: 0 } }).lines[0], /без изменений/);
+  const full = mod.changeLines({
+    profile: { known: true, added: 3, removed: 1, lines: ["+ new rule", "- old rule"], more: 5 },
+    tools: { added: ["figma"], removed: ["jira", "teams"] },
+    plugins: { added: ["a@pkg"], removed: [] },
+  });
+  assert.equal(full.lines[0], "CLAUDE.md: добавлено строк 3, убрано 1");
+  assert.ok(full.lines.includes("Инструменты добавлены: figma"));
+  assert.ok(full.lines.includes("Инструменты убраны: jira, teams"));
+  assert.ok(full.lines.includes("Плагины добавлены: a@pkg"));
+  assert.equal(full.lines.some((l) => /Плагины убраны/.test(l)), false, "an empty list gives no line");
+  assert.deepEqual(full.diff, ["+ new rule", "- old rule", "…и ещё строк: 5"]);
+});
+
+test("Update: the card shows what changes in the profile, nothing goes to the hub until the owner confirms, cancel sends nothing", async () => {
+  hub.lang = "ru"; hub.reply = { ok: true };
+  store["specialists:updating"] = "{}";
+  const changes = {
+    base: "a1", to: "b2",
+    profile: { known: true, added: 2, removed: 1, lines: ["+ trust the owner", "- old rule"], more: 0 },
+    tools: { added: ["figma"], removed: [] }, plugins: { added: [], removed: [] },
+  };
+  STATUS = { checked_at: 10, req: "c-1", rows: { analyst: row("0.1.2", "0.2.0", { changes }) } };
+  snap = { sessions: [hubSess, { name: "analyst" }] };
+  hub.view.show();
+  await wait(50);
+  await draw();
+  sent.length = 0;
+  await button(cards().analyst, "sp-upd").click();
+  assert.equal(sent.length, 0, "the first press only asks");
+  const text = cards().analyst.text();
+  assert.match(text, /Обновить analyst до 0\.2\.0\?/);
+  assert.match(text, /CLAUDE\.md: добавлено строк 2, убрано 1/);
+  assert.match(text, /Инструменты добавлены: figma/);
+  assert.match(text, /\+ trust the owner/, "the diff of the profile is on the card");
+  button(cards().analyst, "sp-no").click();
+  assert.equal(sent.length, 0, "cancel sends nothing");
+  assert.ok(button(cards().analyst, "sp-upd"), "cancel brought the button back");
+  await button(cards().analyst, "sp-upd").click();
+  await button(cards().analyst, "sp-upd-yes").click();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][1].text, mod.updateText("analyst"));
+  assert.equal(sent[0][1].action, true);
+  STATUS = null;
+});
+
+test("Update without data about the change: the card says so and the owner still decides", async () => {
+  hub.lang = "ru";
+  store["specialists:updating"] = "{}";
+  STATUS = { checked_at: 11, req: "c-2", rows: { analyst: row("0.1.2", "0.2.0") } };
+  snap = { sessions: [hubSess, { name: "analyst" }] };
+  hub.view.show();
+  await wait(50);
+  await draw();
+  sent.length = 0;
+  await button(cards().analyst, "sp-upd").click();
+  assert.match(cards().analyst.text(), /не смог выяснить, что меняется/);
+  assert.equal(sent.length, 0);
+  button(cards().analyst, "sp-no").click();
+  STATUS = null;
+});
+
+test("the page registers without the group slot and without ext.js (as in a hub that has no such slot)", async () => {
+  const added = [];
+  const bare = { ...hub, addView: (v) => added.push(["view", v.id]), addSlot: () => { throw new Error("unknown slot"); } };
+  assert.doesNotThrow(() => mod.default(bare));
+  assert.equal(added.length, 1, "the plugin view is there");
 });

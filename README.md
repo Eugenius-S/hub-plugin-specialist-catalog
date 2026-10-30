@@ -47,8 +47,9 @@ for the owner: add the package as a Claude Code marketplace, `hub tools import s
 
 ## On the hub page
 
-The "+" in the header of the "Specialists" group opens the catalog: packages from `specialists.json` with icon, description
-and version. An agent with that name exists: "✓ Installed"; otherwise "Install", which asks the hub to run
+The catalog is in the ☰ menu ("Specialists catalog"). The plugin adds a shortcut only to a slot the page really offers (it
+reads the page's slot list first); on a page without such a slot there is just the menu entry, and nothing fails. The catalog
+lists packages from `specialists.json` with icon, description and version. An agent with that name exists: "✓ Installed"; otherwise "Install", which asks the hub to run
 `specialists install <name>` (the hub installs, not the page). The button waits until the agent shows up.
 
 Removing: the trash icon on an installed card. A confirmation on the card says what goes away (the agent leaves the list;
@@ -63,9 +64,10 @@ Built-in agents of the hub (the core marks them `system` in the snapshot) are li
 the core does not let them go.
 
 "Check for updates" asks the plugin process to compare the installed version of every package with the latest one in its
-repo; where a newer one is out, "✓ Installed" turns into "Update" (a request to the hub: `specialists update <name>`).
+repo; where a newer one is out (or the repo head moved off the pinned commit), "✓ Installed" turns into "Update". "Update"
+first opens a card with what changes in the profile (lines added and removed in `CLAUDE.md` with the first lines of the diff,
+tools and plugins added or removed); only "Update" on that card sends the request to the hub (`specialists update <name>`).
 
-The catalog is also in the ☰ menu ("Specialists catalog"): the slot for the "+" (`sidebar.group`) is not in every hub.
 Page strings are English and Russian, by the hub's language.
 
 ## What it reads, writes and sends
@@ -77,8 +79,9 @@ Page strings are English and Russian, by the hub's language.
 - **Reads**: the catalog (`specialists.json` or the `catalog` setting), the hub's snapshot (`hub status --json`), the agent
   file it asked the agent to write, and its own feed channel on the hub page (`127.0.0.1`, `/api/feed`) for "Check for
   updates" requests posted by the owner.
-- **Network**: `git clone` of package repos listed in the catalog (install, update, and the update check: a shallow clone
-  without checkout). Nothing else leaves the machine.
+- **Network**: `git fetch` / `git clone` of package repos listed in the catalog: exactly the pinned commit (shallow), for
+  install, update, the update check and the preview of what an update changes. The repo address always goes after `--`.
+  Nothing else leaves the machine.
 - **Sends** through `hub` commands only: `hub session new` (the agent or trial session), `hub send <agent>` (the request
   to write its profile), `hub session reload`, `hub tools grant` (a risky tool goes to the owner as a card),
   `hub send hub` (removing a session), and for a trial session `hub session close` / `hub session remove`. The page sends
@@ -98,6 +101,7 @@ Icon (icon.png): [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8; me
 
 - A specialist package: profile, `CLAUDE.md`, tools, eval cases; `specialists install <name>` creates the agent, hands it
   its profile, checks the agent file and asks for the tools.
-- `specialists update` brings a new version through the same check; the local section of the agent file is kept.
+- Every catalog entry pins a full commit (`commit` in `specialists.json`): install and update take exactly that commit,
+  not the branch head. `update` brings the pinned version through the same check; the local section of the agent file is kept.
 - On the page: install, remove with a confirmation, "Share" for agents without a package, built-in agents without buttons.
-- "Check for updates" compares installed and latest versions and offers "Update".
+- "Check for updates" compares installed and latest versions and offers "Update" after a confirmation card with the changes.

@@ -449,6 +449,109 @@ class Adopt(Base):
                          "# designer by hand\n")
 
 
+def head(root):
+    return subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+
+
+class Pinned(Base):
+    """The catalog pins every package to a full commit: install and update take exactly that commit."""
+
+    def setUp(self):
+        super().setUp()
+        package(self.pkg, claude=CLAUDE + "first\n")
+        commit(self.pkg, "first")
+        self.first = head(self.pkg)
+        package(self.pkg, man=dict(MAN, version="0.2.0"), claude=CLAUDE + "second\n")
+        commit(self.pkg, "second")
+        self.second = head(self.pkg)
+
+    def pin(self, sha):
+        with open(sp.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "analyst", "repo": self.pkg, "version": "0.1.0", "commit": sha}], f)
+
+    def test_install_takes_the_pinned_commit_not_the_head(self):
+        self.pin(self.first)
+        self.install()
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual(rec["version"], "0.1.0")
+        self.assertEqual(rec["commit"], self.first)
+        self.assertIn("first", pathlib.Path(self.hub.agent_file("analyst")).read_text(encoding="utf-8"))
+
+    def test_a_pin_that_is_not_a_full_sha_is_refused(self):
+        for bad in ("main", "90516c9", "HEAD", self.first[:12]):
+            self.pin(bad)
+            self.assertIn("full commit sha", self.fails("install", "analyst", "--cwd", os.path.join(self.tmp, "w")))
+        self.assertEqual(self.hub.sessions, {})
+
+    def test_a_pin_missing_in_the_repo_installs_nothing(self):
+        self.pin("0" * 40)
+        self.assertIn("cannot fetch package", self.fails("install", "analyst", "--cwd", os.path.join(self.tmp, "w")))
+        self.assertEqual(self.hub.sessions, {})
+
+    def test_update_moves_to_the_new_pin_even_when_the_version_is_the_same(self):
+        self.pin(self.first)
+        self.install()
+        package(self.pkg, man=dict(MAN, version="0.1.0"), claude=CLAUDE + "third\n")   # the same version, other profile
+        commit(self.pkg, "third")
+        third = head(self.pkg)
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
+        self.pin(third)
+        out = self.run_cli("update", "analyst")
+        self.assertNotIn("is the latest", out)
+        self.assertEqual(self.state_file()["installed"]["analyst"]["commit"], third)
+        self.assertIn("third", pathlib.Path(self.hub.agent_file("analyst")).read_text(encoding="utf-8"))
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
+
+    def test_update_does_not_run_past_the_pin(self):
+        self.pin(self.first)
+        self.install()
+        out = self.run_cli("update", "analyst")   # the repo head is 0.2.0, the pin still the first commit
+        self.assertIn("is the latest", out)
+        self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.1.0")
+
+    def test_adopt_records_the_pinned_commit(self):
+        self.pin(self.first)
+        self.hub.sessions["designer"] = {"state": "idle", "session_id": "sid-designer", "kind": "work", "role": "agent"}
+        os.makedirs(os.path.dirname(self.hub.agent_file("designer")))
+        pathlib.Path(self.hub.agent_file("designer")).write_text("# by hand\n", encoding="utf-8")
+        self.run_cli("adopt", "designer", "analyst")
+        self.assertEqual(self.state_file()["installed"]["designer"]["commit"], self.first)
+
+    def git_calls(self, work):
+        """argv of every git run while `work` goes."""
+        calls, real = [], subprocess.run
+
+        def spy(cmd, *a, **kw):
+            if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "git":
+                calls.append(list(cmd))
+            return real(cmd, *a, **kw)
+        subprocess.run = spy
+        try:
+            work()
+        finally:
+            subprocess.run = real
+        return calls
+
+    def test_the_address_always_follows_two_dashes(self):
+        for sha in (self.first, ""):    # a pinned fetch and a plain clone
+            self.pin(sha)
+            calls = self.git_calls(lambda: sp.fetch(self.pkg, sha)[1] and shutil.rmtree(sp.fetch(self.pkg, sha)[1], True))
+            talking = [c for c in calls if any(x in c for x in ("clone", "fetch"))]
+            self.assertTrue(talking)
+            for c in talking:
+                src = os.path.abspath(self.pkg)
+                self.assertIn(src, c)
+                self.assertEqual(c[c.index(src) - 1], "--", c)
+
+    def test_an_address_that_looks_like_an_option_is_not_an_option(self):
+        marker = os.path.join(self.tmp, "ran")
+        evil = f"--upload-pack=touch {marker}"
+        for sha in (self.first, ""):
+            with self.assertRaises(SystemExit):
+                sp.fetch(evil, sha)
+            self.assertFalse(os.path.exists(marker))
+
+
 class HubCommand(unittest.TestCase):
     """The hub command: SPECIALISTS_HUB first, then shutil.which (hub.cmd on Windows), then HUB_NESTED_*."""
     def setUp(self):
@@ -538,6 +641,19 @@ class PageFiles(unittest.TestCase):
         for p in json.loads((root / "specialists.json").read_text(encoding="utf-8")):
             self.assertTrue(p["name"] and p["repo"] and p["version"] and p["icon"] and p["about"], p)
 
+    def test_every_catalog_entry_pins_a_full_commit(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        for p in json.loads((root / "specialists.json").read_text(encoding="utf-8")):
+            self.assertRegex(p.get("commit", ""), r"^([0-9a-f]{40}|[0-9a-f]{64})$", p["name"])
+
+    def test_nothing_names_the_slot_only_our_core_has(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        man = json.loads((root / "hub-plugin.json").read_text(encoding="utf-8"))
+        for text in (man["description"], man["i18n"]["ru"]["description"], man.get("why", ""),
+                     (root / "README.md").read_text(encoding="utf-8")):
+            self.assertNotIn("sidebar.group", text)
+            self.assertNotRegex(text, r'the "\+"|"\+" ')
+
     def test_manifest_texts_fit_the_catalog(self):
         root = pathlib.Path(__file__).resolve().parent.parent
         man = json.loads((root / "hub-plugin.json").read_text(encoding="utf-8"))
@@ -592,7 +708,7 @@ class Process(unittest.TestCase):
 
     def test_check_marks_only_the_lagging_package(self):
         answers = {"https://example.invalid/analyst": ("0.2.0", ""), "https://example.invalid/writer": ("0.3.0", "")}
-        proc.check_all(now=100, probe=lambda repo: answers[repo])
+        proc.check_all(now=100, probe=lambda repo, commit="": answers[repo])
         status = proc.build("c-1")
         self.assertEqual(status["req"], "c-1")
         self.assertEqual(status["checked_at"], 100)
@@ -601,7 +717,7 @@ class Process(unittest.TestCase):
         self.assertFalse(status["rows"]["writer"]["update"])
 
     def test_one_package_failing_does_not_hide_the_rest(self):
-        def probe(repo):
+        def probe(repo, commit=""):
             return ("", "Could not resolve host") if repo.endswith("analyst") else ("0.4.0", "")
         proc.check_all(now=1, probe=probe)
         rows = proc.build()["rows"]
@@ -613,12 +729,12 @@ class Process(unittest.TestCase):
         with open(proc.CATALOG, "w", encoding="utf-8") as f:
             json.dump([{"name": "analyst", "repo": "https://example.invalid/moved"}], f)
         seen = []
-        proc.check_all(now=1, probe=lambda repo: seen.append(repo) or ("0.1.0", ""))
+        proc.check_all(now=1, probe=lambda repo, commit="": seen.append(repo) or ("0.1.0", ""))
         self.assertIn("https://example.invalid/moved", seen)
         self.assertIn("https://example.invalid/writer", seen)
 
     def test_installed_version_follows_state_without_a_new_check(self):
-        proc.check_all(now=1, probe=lambda repo: ("0.2.0", ""))
+        proc.check_all(now=1, probe=lambda repo, commit="": ("0.2.0", ""))
         self.assertTrue(proc.build()["rows"]["analyst"]["update"])
         self.installed({"analyst": ("analyst", "0.2.0"), "writer": ("writer", "0.3.0")})   # specialists update ran
         self.assertFalse(proc.build()["rows"]["analyst"]["update"])
@@ -651,6 +767,100 @@ class Process(unittest.TestCase):
         version, why = proc.latest_version(os.path.join(self.tmp, "nowhere"))
         self.assertEqual(version, "")
         self.assertTrue(why)
+
+
+class ProcessPinned(Process):
+    """The update check follows the catalog's pin and shows what an update would change in the profile."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = package(os.path.join(self.tmp, "repo"), claude=CLAUDE + "one\nkeep\n")
+        commit(self.repo, "one")
+        self.one = head(self.repo)
+        package(self.repo, man=dict(MAN, version="0.2.0"), claude=CLAUDE + "two\nkeep\n")
+        commit(self.repo, "two")
+        self.two = head(self.repo)
+        package(self.repo, man=dict(MAN, version="0.3.0"), claude=CLAUDE + "three\nkeep\n")
+        commit(self.repo, "three")
+
+    def pin(self, sha):
+        with open(proc.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "analyst", "repo": self.repo, "version": "0.1.0", "commit": sha}], f)
+
+    def record(self, **extra):
+        os.makedirs(os.path.join(proc.STATE, "specialists"), exist_ok=True)
+        with open(os.path.join(proc.STATE, "specialists", "state.json"), "w", encoding="utf-8") as f:
+            json.dump({"installed": {"analyst": dict({"package": "analyst", "version": "0.1.0", "repo": self.repo}, **extra)}}, f)
+
+    def test_latest_version_is_read_at_the_pin_not_at_the_head(self):
+        self.assertEqual(proc.latest_version(self.repo, self.two), ("0.2.0", ""))
+        self.assertEqual(proc.latest_version(self.repo), ("0.3.0", ""))
+        version, why = proc.latest_version(self.repo, "f" * 40)
+        self.assertEqual(version, "")
+        self.assertTrue(why)
+
+    def test_a_pinned_package_must_be_a_git_repo(self):
+        plain = package(os.path.join(self.tmp, "plain"), man=dict(MAN, version="0.6.1"))
+        self.assertEqual(proc.latest_version(plain, self.one)[0], "")
+
+    def test_the_check_asks_at_the_pin(self):
+        self.pin(self.two)
+        self.record(commit=self.one)
+        proc.check_all(now=1)
+        row = proc.build()["rows"]["analyst"]
+        self.assertEqual(row["latest"], "0.2.0")
+        self.assertTrue(row["update"])
+
+    def test_same_version_other_commit_is_still_an_update_with_its_preview(self):
+        package(self.repo, man=dict(MAN, version="0.1.0"), claude=CLAUDE + "other\nkeep\n",
+                extra={"plugins/x/.claude-plugin/plugin.json": "{}"})
+        commit(self.repo, "same version")
+        pin = head(self.repo)
+        self.pin(pin)
+        self.record(commit=self.one)
+        proc.check_all(now=1)
+        row = proc.build()["rows"]["analyst"]
+        self.assertTrue(row["update"])
+        ch = row["changes"]
+        self.assertEqual((ch["base"], ch["to"]), (self.one, pin))
+        self.assertTrue(ch["profile"]["known"])
+        self.assertIn("+other", ch["profile"]["lines"])
+        self.assertIn("-one", ch["profile"]["lines"])
+        self.assertNotIn("+keep", ch["profile"]["lines"])
+
+    def test_changes_name_tools_and_plugins(self):
+        self.pin(self.two)
+        man = dict(MAN, version="0.2.0", agent=dict(MAN["agent"], tools={"need": [{"id": "figma", "why": "x"}], "optional": []}))
+        package(self.repo, man=man, claude=CLAUDE)
+        commit(self.repo, "tools")
+        pin = head(self.repo)
+        ch = proc.changes_of(self.repo, pin, {"package": "analyst", "version": "0.1.0", "commit": self.one,
+                                              "tool_ids": ["research"], "plugins": []})
+        self.assertEqual(ch["tools"]["added"], ["figma"])
+        self.assertEqual(ch["tools"]["removed"], ["research"])
+
+    def test_a_record_without_a_commit_has_no_moved_flag_and_no_diff(self):
+        self.pin(self.two)
+        self.record()    # installed by 0.9.0: no commit recorded
+        proc.check_all(now=1)
+        row = proc.build()["rows"]["analyst"]
+        self.assertTrue(row["update"])           # 0.1.0 < 0.2.0 by version
+        self.assertNotIn("changes", row)
+
+    def test_a_preview_for_another_base_is_not_shown(self):
+        self.pin(self.two)
+        self.record(commit=self.one)
+        proc.check_all(now=1)
+        self.record(commit=self.two)              # updated meanwhile: the old preview is stale
+        self.assertNotIn("changes", proc.build()["rows"]["analyst"])
+
+    def test_git_gets_the_address_after_two_dashes(self):
+        marker = os.path.join(self.tmp, "ran")
+        evil = f"--upload-pack=touch {marker}"
+        self.assertEqual(proc.latest_version(evil)[0], "")
+        self.assertEqual(proc.latest_version(evil, self.one)[0], "")
+        self.assertIsNone(proc.changes_of(evil, self.one, {"commit": self.two}))
+        self.assertFalse(os.path.exists(marker))
 
 
 if __name__ == "__main__":

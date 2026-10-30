@@ -149,20 +149,60 @@ def load_catalog():
 
 # --- package -----------------------------------------------------------------------------------------------------
 
-def fetch(repo):
-    """The package folder: a git repo (local or remote) is cloned fresh into a temp folder; a plain folder is used as is.
-    (folder, temp folder to remove afterwards or False)."""
+SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+
+
+def fetch_commit(src, commit, to):
+    """The package at exactly `commit` in `to` (the commit by itself, shallow; else all branches). "" or the reason."""
+    out = git("init", "-q", to)
+    if out.returncode:
+        return out.stderr.strip()
+    for cmd in (("fetch", "-q", "--depth", "1", "--no-tags", "--", src, commit),
+                ("fetch", "-q", "--no-tags", "--", src, "+refs/heads/*:refs/remotes/origin/*")):
+        out = git("-C", to, *cmd)
+        if not out.returncode and not git("-C", to, "checkout", "-q", "--detach", commit).returncode:
+            got = git("-C", to, "rev-parse", "HEAD").stdout.strip()
+            return "" if got == commit else f"got {got[:12]}, not the pinned {commit[:12]}"
+    return out.stderr.strip() or f"the commit {commit[:12]} is not in the repo"
+
+
+def fetch(repo, commit=""):
+    """The package folder: a git repo (local or remote) is cloned fresh into a temp folder, at `commit` when the catalog
+    pins one; a plain folder is used as is. (folder, temp folder to remove afterwards or False)."""
     local = os.path.expanduser(repo)
+    if commit and not SHA.fullmatch(commit):
+        die(f"the catalog pins {repo} to \"{commit}\": a full commit sha (40 hex digits) is needed")
     if os.path.isdir(local) and not os.path.isdir(os.path.join(local, ".git")):
+        if commit:
+            die(f"{repo} is a plain folder: it cannot be pinned to commit {commit[:12]}")
         return os.path.abspath(local), False
+    src = os.path.abspath(local) if os.path.isdir(local) else repo
     tmp = tempfile.mkdtemp(prefix="specialist-")
     to = os.path.join(tmp, "pkg")
-    out = subprocess.run(["git", "clone", "-q", "--depth", "1", os.path.abspath(local) if os.path.isdir(local) else repo, to],
-                         capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if out.returncode:
+    if commit:
+        err = fetch_commit(src, commit, to)
+    else:
+        out = git("clone", "-q", "--depth", "1", "--", src, to)
+        err = out.stderr.strip() if out.returncode else ""
+    if err:
         rmtree_force(tmp)
-        die(f"cannot fetch package {repo}: {out.stderr.strip()[:300]}")
+        die(f"cannot fetch package {repo}: {err[:300]}")
     return to, tmp
+
+
+def head_of(root):
+    """The commit of a fetched package ("" for a plain folder)."""
+    return git("-C", root, "rev-parse", "HEAD").stdout.strip() if os.path.isdir(os.path.join(root, ".git")) else ""
+
+
+def pinned(name):
+    """The commit the catalog pins for a package ("" for a link or a folder of one's own, or an entry without a pin)."""
+    return next((str(i.get("commit") or "") for i in load_catalog() if i["name"] == name), "") if name else ""
 
 
 def text_files(root):
@@ -532,8 +572,8 @@ def wait_session(agent):
 def cmd_install(args):
     status = hub_status()
     who_may(status)
-    _, repo = find(args.what)
-    root, tmp = fetch(repo)
+    name, repo = find(args.what)
+    root, tmp = fetch(repo, pinned(name))
     try:
         man, bad = check(root, hub_version())
         if bad:
@@ -564,8 +604,8 @@ def cmd_install(args):
         if refused(code, out):
             die("the hub did not create the " + ("session" if args.trial else "agent"))
         sess = wait_session(agent)
-        rec = {"package": man["name"], "version": man["version"], "repo": repo, "session_id": sess["session_id"],
-               "cwd": cwd, "tool_ids": tool_ids(man), "plugins": package_plugins(root), "installed_at": int(time.time())}
+        rec = {"package": man["name"], "version": man["version"], "repo": repo, "commit": head_of(root),
+               "session_id": sess["session_id"], "cwd": cwd, "tool_ids": tool_ids(man), "plugins": package_plugins(root), "installed_at": int(time.time())}
         if args.trial:
             rec.update(agent_file=path, trial=True)
             say(f"CLAUDE.md of the trial session: {path}")
@@ -627,15 +667,15 @@ def cmd_adopt(args):
     path = agent_file_path(sess)
     if not os.path.isfile(path):
         die(f"no agent file {path}: nothing to adopt (install it instead: specialists install)")
-    _, repo = find(args.package or agent)
-    root, tmp = fetch(repo)
+    name, repo = find(args.package or agent)
+    root, tmp = fetch(repo, pinned(name))
     try:
         man, bad = check(root, hub_version())
         if bad:
             die(f"package {repo} rejected:\n  - " + "\n  - ".join(bad))
         st = load_state()
         st["installed"][agent] = {"package": man["name"], "version": man["version"], "repo": repo,
-                                  "session_id": sess["session_id"], "agent_file": path,
+                                  "commit": head_of(root), "session_id": sess["session_id"], "agent_file": path,
                                   "cwd": sess.get("cwd") or os.path.abspath(os.path.expanduser(man["agent"]["cwd"])),
                                   "tools": {"asked": [], "missing": []},   # a live agent already has its tools
                                   "tool_ids": tool_ids(man), "plugins": package_plugins(root),
@@ -666,12 +706,13 @@ def cmd_update(args):
     st = load_state()
     agent, rec = installed(st, args.name)
     repo = next((i["repo"] for i in load_catalog() if i["name"] == rec["package"]), rec["repo"])
-    root, tmp = fetch(repo)
+    pin = pinned(rec["package"])
+    root, tmp = fetch(repo, pin)
     try:
         man, bad = check(root, hub_version())
         if bad:
             die(f"the new version of {repo} is rejected:\n  - " + "\n  - ".join(bad))
-        if man["version"] == rec["version"]:
+        if man["version"] == rec["version"] and (not pin or rec.get("commit") in ("", None, pin)):
             return say(f"{agent}: version {rec['version']} is the latest")
         path = rec["agent_file"]
         body, carried = carry_local(fill(read(os.path.join(root, "CLAUDE.md")), path, rec["cwd"]), path)
@@ -693,7 +734,7 @@ def cmd_update(args):
             hand_profile(agent, rec, args.no_notify, PROFILE_WAIT)
         added = [t for t in tool_ids(man) if t not in rec.get("tool_ids", [])]
         fresh = [p for p in package_plugins(root) if p not in rec.get("plugins", [])]
-        rec.update(version=man["version"], repo=repo, tool_ids=tool_ids(man), plugins=package_plugins(root))
+        rec.update(version=man["version"], repo=repo, commit=head_of(root), tool_ids=tool_ids(man), plugins=package_plugins(root))
         save_state(st)
         plugins_hint(agent, man["name"], repo, fresh)
         if added:

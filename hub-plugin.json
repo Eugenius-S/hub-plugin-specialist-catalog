@@ -1,16 +1,16 @@
 {
   "name": "specialists",
   "icon": "icon.png",
-  "description": "Ready-made agents from a catalog: press Install and the hub sets up the specialist, hands it its profile, checks the result and asks for the tools it needs. An update keeps your local notes in the agent's file. The catalog opens with the plus next to the Specialists group.",
+  "description": "Ready-made agents from a catalog: press Install and the hub sets up the specialist, hands it its profile, checks the result and asks for the tools it needs. An update keeps your local notes in the agent's file. The catalog is in the ☰ menu.",
   "why": "Install a ready-made specialist with one command instead of building your own: the package is checked, the agent is set up, the tools are requested",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "hub": "^1.15",
   "skills": true,
   "web": "main.js",
   "run": ["python3", "main.py"],
   "i18n": {
     "ru": {
-      "description": "Готовые агенты из каталога: нажмите «Поставить», и хаб заведёт специалиста, передаст ему профиль, проверит результат и попросит нужные инструменты. Обновление сохраняет ваши местные заметки в файле агента. Каталог открывается плюсом у группы «Специалисты».",
+      "description": "Готовые агенты из каталога: нажмите «Поставить», и хаб заведёт специалиста, передаст ему профиль, проверит результат и попросит нужные инструменты. Обновление сохраняет ваши местные заметки в файле агента. Каталог — в меню ☰.",
       "why": "Поставить готового специалиста одной командой вместо сборки своего: пакет проверен, агент заведён, инструменты запрошены"
     }
   }

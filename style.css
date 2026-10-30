@@ -43,3 +43,4 @@
 .sp-sure { color: var(--foreground); font-size: var(--text-sm, 14px); font-weight: 600; }
 .sp-confirm-note { margin-top: var(--space-1, 4px); color: var(--muted-foreground); font-size: var(--text-sm, 14px); }
 .sp-err { margin-top: var(--space-1, 4px); color: var(--destructive); font-size: var(--text-xs, 12px); }
+.sp-diff { margin: var(--space-2, 8px) 0 0; padding: var(--space-2, 8px); max-height: 180px; overflow: auto; background: var(--muted); border-radius: var(--radius-sm, 6px); color: var(--foreground); font-size: var(--text-xs, 12px); white-space: pre-wrap; word-break: break-word; }
