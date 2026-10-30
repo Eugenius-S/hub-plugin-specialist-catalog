@@ -54,6 +54,7 @@ const STR = {
     check_silent: "The plugin process did not answer in {min} min. Restart the plugin and try again.",
     update: "Update", update_title: "To the hub: specialists update {name}", update_wait_title: "The hub is updating it; the card goes back to “Installed”",
     update_refused: "The hub did not take the request: {err}", row_failed: "Could not check the version: {err}",
+    row_dropped: "No longer in the catalog: remove it, or keep it as your own (specialists adopt)",
     upd_sure: "Update {name} to {to}?", upd_yes: "Update",
     upd_note: "The hub will replace the profile with the new package version. Nothing changes before you confirm.",
     upd_unknown: "The plugin could not work out what changes in the profile. It is the package version {to}.",
@@ -89,6 +90,7 @@ const STR = {
     check_silent: "Процесс плагина не ответил за {min} мин. Перезапусти плагин и повтори.",
     update: "Обновить", update_title: "Хабу: specialists update {name}", update_wait_title: "Хаб обновляет; карточка вернётся к «Поставлен»",
     update_refused: "Хаб не принял просьбу: {err}", row_failed: "Не удалось узнать версию: {err}",
+    row_dropped: "Больше нет в каталоге: удали или оставь своим (specialists adopt)",
     upd_sure: "Обновить {name} до {to}?", upd_yes: "Обновить",
     upd_note: "Хаб заменит профиль на новую версию пакета. Пока не подтвердишь, ничего не меняется.",
     upd_unknown: "Плагин не смог выяснить, что меняется в профиле. Это версия пакета {to}.",
@@ -205,8 +207,9 @@ export function changeLines(changes, to = "") {
 export function verdict(st) {
   const rows = Object.values((st && st.rows) || {});
   if (!rows.length) return { key: "none", vars: {} };
-  const n = rows.filter((r) => r.update).length, bad = rows.filter((r) => !r.latest && r.error);
-  if (bad.length === rows.length) return { key: "check_failed", vars: { err: bad[0].error }, bad: true };
+  // dropped from the catalog is its own state, not a broken check
+  const n = rows.filter((r) => r.update).length, bad = rows.filter((r) => !r.latest && r.error && !r.dropped);
+  if (bad.length && bad.length === rows.length) return { key: "check_failed", vars: { err: bad[0].error }, bad: true };
   return { key: n ? "found" : "all_latest", vars: { n }, extra: bad.length ? { key: "check_partial", vars: { n: bad.length } } : null };
 }
 
@@ -358,7 +361,8 @@ function render(root, snap) {
       const state = stateOf(p.name, sessions, ask, now, drop);
       const sr = status && status.rows && Object.hasOwn(status.rows, p.name) ? status.rows[p.name] : null;
       return { ...p, state, upd: state === "have" ? updateOf(p.name, status, upd, now) : null,
-        verr: state === "have" && sr && !sr.latest && sr.error ? sr.error : "",
+        verr: state === "have" && sr && !sr.latest && sr.error && !sr.dropped ? sr.error : "",
+        gone: state === "have" && !!sr && !!sr.dropped,
         have_ver: state === "have" && sr ? sr.installed : "" };
     });
   // "not in the catalog": in the hub without a package; they get "Share" and the trash (a built-in one with a package name is shown above as built in)
@@ -406,6 +410,7 @@ function row(p) {
   body.append(top, hub.el("div", "sp-about", p.about || ""));
   if (p.state === "stuck") body.append(hub.el("div", "sp-err", tr(p.local ? "stuck_local" : "stuck", { min: DROP_TTL / 60000 })));
   if (p.verr) body.append(hub.el("div", "sp-err", tr("row_failed", { err: p.verr })));
+  if (p.gone) body.append(hub.el("div", "sp-err", tr("row_dropped")));
   if (errors[p.name]) body.append(hub.el("div", "sp-err", errors[p.name]));
   const act = hub.el("div", "sp-act");
   let confirm = null;

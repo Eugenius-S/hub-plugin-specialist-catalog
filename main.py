@@ -66,6 +66,15 @@ def follows(rec):
     return rec.get("repo") or "", ""
 
 
+def dropped(rec):
+    """As `specialists update`: a package from the catalog that a readable, non-empty catalog no longer holds. There is
+    nothing to ask about it and nothing to update from; an unreadable or empty catalog says nothing."""
+    if rec.get("source") == "own":
+        return False
+    items = [i for i in read_json(CATALOG, []) if isinstance(i, dict) and i.get("name")]
+    return bool(items) and not any(i["name"] == rec.get("package") for i in items)
+
+
 def key_of(rec):
     """Where the answer about the latest version lives: the package, or the own address for one of one's own."""
     return "own:" + (rec.get("repo") or "") if rec.get("source") == "own" else rec.get("package") or ""
@@ -216,7 +225,7 @@ def check_all(now=None, probe=latest_version, diff=changes_of):
     commit is asked at that commit, and every agent behind it gets the preview of what its update changes."""
     packages = {}
     for rec in installed().values():
-        if rec.get("package"):
+        if rec.get("package") and not dropped(rec):
             packages.setdefault(key_of(rec), rec)
     got, seen = {}, {}
 
@@ -225,6 +234,8 @@ def check_all(now=None, probe=latest_version, diff=changes_of):
         got[key] = {"version": version, "error": err}
 
     def preview(agent, rec):
+        if dropped(rec):
+            return
         repo, pin = follows(rec)
         if pin and rec.get("commit") and rec["commit"] != pin:
             seen[agent] = diff(repo, pin, rec)
@@ -247,6 +258,10 @@ def build(req=""):
     answers = seen.get("packages") or {}
     rows = {}
     for agent, rec in installed().items():
+        if dropped(rec):   # the catalog no longer holds it: no version to offer, update is refused (remove or adopt)
+            rows[agent] = {"package": rec.get("package") or agent, "installed": rec["version"], "latest": "",
+                           "update": False, "error": "", "dropped": True}
+            continue
         a = answers.get(key_of(rec)) or {}
         latest = a.get("version") or ""
         pin = follows(rec)[1]

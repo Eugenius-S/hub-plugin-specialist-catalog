@@ -545,6 +545,35 @@ class Pinned(Base):
         self.assertIn("is the latest", self.run_cli("update", "analyst"))
         self.assertEqual(self.state_file()["installed"]["analyst"]["repo"], self.pkg)
 
+    def drop_from_catalog(self):
+        """The catalog stays readable but no longer holds the package (another one is listed)."""
+        with open(sp.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "writer", "repo": os.path.join(self.tmp, "writer"), "version": "0.1.0", "commit": "2" * 40}], f)
+
+    def test_update_refuses_a_package_the_catalog_no_longer_holds(self):
+        self.pin(self.first)
+        self.install()
+        self.drop_from_catalog()
+        calls = self.git_calls(lambda: self.assertIn("no longer in the catalog", self.fails("update", "analyst")))
+        self.assertEqual([c for c in calls if any(x in c for x in ("clone", "fetch"))], [])   # nothing is taken from the old repo
+        msg = self.fails("update", "analyst")
+        self.assertIn("specialists remove analyst", msg)
+        self.assertIn("specialists adopt analyst", msg)
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["commit"], rec["version"], rec["repo"]), (self.first, "0.1.0", self.pkg))
+
+    def test_an_unreadable_catalog_is_not_a_dropped_package(self):
+        self.pin(self.first)
+        self.install()
+        os.remove(sp.CATALOG)
+        self.assertIn("0.1.0 -> 0.2.0", self.run_cli("update", "analyst"))   # cannot tell: as before
+
+    def test_an_own_package_stays_when_the_catalog_drops_the_name(self):
+        self.pin(self.first)
+        self.run_cli("install", self.pkg, "--cwd", os.path.join(self.tmp, "work"))
+        self.drop_from_catalog()
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
+
     def test_adopt_records_the_pinned_commit(self):
         self.pin(self.first)
         self.hub.sessions["designer"] = {"state": "idle", "session_id": "sid-designer", "kind": "work", "role": "agent"}
@@ -884,6 +913,29 @@ class ProcessPinned(Process):
                                               "tool_ids": ["research"], "plugins": []})
         self.assertEqual(ch["tools"]["added"], ["figma"])
         self.assertEqual(ch["tools"]["removed"], ["research"])
+
+    def test_a_package_the_catalog_dropped_is_not_asked_and_is_marked(self):
+        self.pin(self.two)
+        self.record(commit=self.one)
+        with open(proc.CATALOG, "w", encoding="utf-8") as f:    # readable, but analyst is gone from it
+            json.dump([{"name": "writer", "repo": self.repo, "version": "0.1.0", "commit": self.two}], f)
+        asked = []
+        proc.check_all(now=1, probe=lambda repo, commit="": asked.append(repo) or ("9.9.9", ""))
+        self.assertEqual(asked, [])
+        row = proc.build()["rows"]["analyst"]
+        self.assertTrue(row["dropped"])
+        self.assertFalse(row["update"])
+        self.assertEqual((row["latest"], row["error"]), ("", ""))
+        self.assertNotIn("changes", row)
+
+    def test_an_own_package_is_still_asked_when_the_catalog_drops_the_name(self):
+        self.record(source="own", commit=self.one)
+        with open(proc.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "writer", "repo": self.repo, "version": "0.1.0", "commit": self.two}], f)
+        proc.check_all(now=1)
+        row = proc.build()["rows"]["analyst"]
+        self.assertFalse(row.get("dropped"))
+        self.assertEqual(row["latest"], "0.3.0")
 
     def test_a_record_without_a_commit_has_no_moved_flag_and_no_diff(self):
         self.pin(self.two)

@@ -216,6 +216,21 @@ def follows(rec):
     return rec.get("repo") or "", ""
 
 
+def dropped(rec):
+    """A package from the catalog that a readable, non-empty catalog no longer holds: there is nothing to follow, and
+    the old repo's head is not the catalog's answer. An unreadable or empty catalog says nothing: as before."""
+    if rec.get("source") == "own":
+        return False
+    items = load_catalog()
+    return bool(items) and not any(i["name"] == rec["package"] for i in items)
+
+
+def dropped_text(agent, rec):
+    return (f"{agent}: the package {rec['package']} is no longer in the catalog, so there is nothing to update from. "
+            f"Remove it (specialists remove {agent}), or keep it as your own: remove it, then "
+            f"specialists adopt {agent} <folder or git URL of the package>.")
+
+
 def text_files(root):
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules")]
@@ -717,6 +732,8 @@ def cmd_update(args):
     who_may(status)
     st = load_state()
     agent, rec = installed(st, args.name)
+    if dropped(rec):
+        die(dropped_text(agent, rec))
     repo, pin = follows(rec)
     root, tmp = fetch(repo, pin)
     try:

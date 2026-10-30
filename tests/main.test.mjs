@@ -302,6 +302,26 @@ test("failure: the page does not crash, the cause is a line; the post did not go
   STATUS = null;
 });
 
+test("dropped from the catalog: not a failed check, the card says so and has no Update", async () => {
+  const gone = row("0.1.0", "", { update: false, dropped: true });
+  assert.equal(mod.verdict({ rows: { a: gone } }).key, "all_latest", "a dropped package is not a broken check");
+  assert.equal(mod.verdict({ rows: { a: gone, b: row("1", "2") } }).key, "found");
+  assert.equal(mod.verdict({ rows: { a: gone, b: row("1", "1") } }).extra, null);
+  feed.length = 0;
+  snap = { sessions: [hubSess, { name: "analyst" }, { name: "writer" }] };
+  await draw();
+  hub.feedReply = { ok: true };
+  await checkBtn().click();
+  const token = feed.at(-1).split(" ")[1];
+  STATUS = { checked_at: 5, req: token, rows: { analyst: gone, writer: row("0.1.0", "0.1.0") } };
+  await wait(2300);
+  assert.match(cards().analyst.text(), /Больше нет в каталоге/);
+  assert.doesNotMatch(cards().analyst.text(), /Не удалось узнать версию/);
+  assert.equal(button(cards().analyst, "sp-upd"), undefined, "nothing to update from");
+  assert.doesNotMatch(cards().writer.text(), /Больше нет в каталоге/);
+  STATUS = null;
+});
+
 test("English page: check strings from the en table", () => {
   assert.equal(mod.tr("check", {}, "en"), "Check for updates");
   assert.equal(mod.tr("update", {}, "en"), "Update");
