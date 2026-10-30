@@ -509,16 +509,41 @@ class Pinned(Base):
         self.assertIn("is the latest", out)
         self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.1.0")
 
-    def test_update_keeps_the_address_recorded_at_install(self):
+    def test_update_follows_the_catalog_when_it_moves_the_package(self):
         self.pin(self.first)
         self.install()
-        other = os.path.join(self.tmp, "public-analyst")   # the catalog now lists the package elsewhere, with its own pin
+        moved = package(os.path.join(self.tmp, "public-analyst"), man=dict(MAN, version="0.3.0"), claude=CLAUDE + "moved\n")
+        commit(moved, "moved one")
+        pin = head(moved)
+        package(moved, man=dict(MAN, version="0.4.0"), claude=CLAUDE + "past the pin\n")
+        commit(moved, "past the pin")   # the new repo's head: update must not run past the catalog's pin
         with open(sp.CATALOG, "w", encoding="utf-8") as f:
-            json.dump([{"name": "analyst", "repo": other, "version": "0.9.0", "commit": "1" * 40}], f)
-        out = self.run_cli("update", "analyst")   # the recorded repo, its head: no pin of another address applies
+            json.dump([{"name": "analyst", "repo": moved, "version": "0.3.0", "commit": pin}], f)
+        out = self.run_cli("update", "analyst")
         self.assertNotIn("is the latest", out)
         rec = self.state_file()["installed"]["analyst"]
-        self.assertEqual((rec["repo"], rec["commit"], rec["version"]), (self.pkg, self.second, "0.2.0"))
+        self.assertEqual((rec["repo"], rec["commit"], rec["version"]), (moved, pin, "0.3.0"))
+        self.assertIn("moved", pathlib.Path(rec["profile_file"]).read_text(encoding="utf-8"))
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
+
+    def test_update_never_takes_the_old_repo_head_when_the_catalog_moved(self):
+        self.pin(self.first)
+        self.install()
+        with open(sp.CATALOG, "w", encoding="utf-8") as f:   # moved to a repo that cannot be reached
+            json.dump([{"name": "analyst", "repo": os.path.join(self.tmp, "gone"), "version": "0.9.0", "commit": "1" * 40}], f)
+        self.assertIn("cannot fetch package", self.fails("update", "analyst"))
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["commit"], rec["version"]), (self.first, "0.1.0"))
+
+    def test_a_package_installed_from_its_own_address_keeps_it(self):
+        self.pin(self.first)
+        self.run_cli("install", self.pkg, "--cwd", os.path.join(self.tmp, "work"))   # a folder, not the catalog entry
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["source"], rec["commit"]), ("own", self.second))   # its own head: no catalog pin
+        with open(sp.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "analyst", "repo": os.path.join(self.tmp, "gone"), "version": "0.9.0", "commit": "1" * 40}], f)
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
+        self.assertEqual(self.state_file()["installed"]["analyst"]["repo"], self.pkg)
 
     def test_adopt_records_the_pinned_commit(self):
         self.pin(self.first)
@@ -736,13 +761,23 @@ class Process(unittest.TestCase):
         self.assertFalse(rows["analyst"]["update"])
         self.assertTrue(rows["writer"]["update"])
 
-    def test_recorded_address_wins_over_the_catalog_one(self):
+    def test_the_catalog_address_and_pin_win_for_a_catalog_package(self):
         with open(proc.CATALOG, "w", encoding="utf-8") as f:
             json.dump([{"name": "analyst", "repo": "https://example.invalid/moved", "commit": "1" * 40}], f)
         seen = []
         proc.check_all(now=1, probe=lambda repo, commit="": seen.append((repo, commit)) or ("0.1.0", ""))
-        self.assertIn(("https://example.invalid/analyst", ""), seen)   # the catalog's pin is for its own address only
-        self.assertNotIn("https://example.invalid/moved", [r for r, _ in seen])
+        self.assertIn(("https://example.invalid/moved", "1" * 40), seen)   # where the catalog moved it, at its pin
+        self.assertNotIn("https://example.invalid/analyst", [r for r, _ in seen])   # never the old repo's head
+
+    def test_a_package_of_ones_own_address_is_checked_there(self):
+        with open(os.path.join(proc.STATE, "specialists", "state.json"), "w", encoding="utf-8") as f:
+            json.dump({"installed": {"analyst": {"package": "analyst", "version": "0.1.0", "source": "own",
+                                                 "repo": "https://example.invalid/mine"}}}, f)
+        with open(proc.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "analyst", "repo": "https://example.invalid/moved", "commit": "1" * 40}], f)
+        seen = []
+        proc.check_all(now=1, probe=lambda repo, commit="": seen.append((repo, commit)) or ("0.1.0", ""))
+        self.assertEqual(seen, [("https://example.invalid/mine", "")])
 
     def test_installed_version_follows_state_without_a_new_check(self):
         proc.check_all(now=1, probe=lambda repo, commit="": ("0.2.0", ""))

@@ -55,28 +55,20 @@ def installed():
     return {a: v for a, v in (got or {}).items() if isinstance(v, dict) and v.get("version")}
 
 
-def listed_repo(package):
-    """The catalog's address of a package ("" when the catalog does not list it)."""
-    for item in read_json(CATALOG, []):
-        if isinstance(item, dict) and item.get("name") == package and item.get("repo"):
-            return item["repo"]
-    return ""
+def follows(rec):
+    """As `specialists update`: (repo, pin). A package from the catalog follows the catalog's address and pin, even
+    when the catalog moved it to another repo; a package installed from one's own address keeps that address, no pin."""
+    package = rec.get("package") or ""
+    if rec.get("source") != "own":
+        for item in read_json(CATALOG, []):
+            if isinstance(item, dict) and item.get("name") == package and item.get("repo"):
+                return item["repo"], catalog_commit(package)
+    return rec.get("repo") or "", ""
 
 
-def same_repo(a, b):
-    """Two addresses of one repo (a trailing slash or .git aside)."""
-    norm = lambda u: (u or "").strip().rstrip("/").removesuffix(".git").lower()
-    return bool(a) and norm(a) == norm(b)
-
-
-def catalog_repo(package, rec):
-    """As `specialists update`: the address recorded at install wins, then the catalog's."""
-    return rec.get("repo") or listed_repo(package)
-
-
-def pin_for(package, rec):
-    """The catalog's pin, only when the agent follows the catalog's own address ("" otherwise)."""
-    return catalog_commit(package) if same_repo(catalog_repo(package, rec), listed_repo(package)) else ""
+def key_of(rec):
+    """Where the answer about the latest version lives: the package, or the own address for one of one's own."""
+    return "own:" + (rec.get("repo") or "") if rec.get("source") == "own" else rec.get("package") or ""
 
 
 def catalog_commit(package):
@@ -224,18 +216,18 @@ def check_all(now=None, probe=latest_version, diff=changes_of):
     commit is asked at that commit, and every agent behind it gets the preview of what its update changes."""
     packages = {}
     for rec in installed().values():
-        packages.setdefault(rec.get("package") or "", rec)
-    packages.pop("", None)
+        if rec.get("package"):
+            packages.setdefault(key_of(rec), rec)
     got, seen = {}, {}
 
-    def one(package, rec):
-        version, err = probe(catalog_repo(package, rec), pin_for(package, rec))
-        got[package] = {"version": version, "error": err}
+    def one(key, rec):
+        version, err = probe(*follows(rec))
+        got[key] = {"version": version, "error": err}
 
     def preview(agent, rec):
-        pin = pin_for(rec.get("package") or "", rec)
+        repo, pin = follows(rec)
         if pin and rec.get("commit") and rec["commit"] != pin:
-            seen[agent] = diff(catalog_repo(rec["package"], rec), pin, rec)
+            seen[agent] = diff(repo, pin, rec)
 
     threads = [threading.Thread(target=one, args=(p, r), daemon=True) for p, r in packages.items()]
     threads += [threading.Thread(target=preview, args=(a, r), daemon=True) for a, r in installed().items()]
@@ -255,9 +247,9 @@ def build(req=""):
     answers = seen.get("packages") or {}
     rows = {}
     for agent, rec in installed().items():
-        a = answers.get(rec.get("package") or "") or {}
+        a = answers.get(key_of(rec)) or {}
         latest = a.get("version") or ""
-        pin = pin_for(rec.get("package") or "", rec)
+        pin = follows(rec)[1]
         moved = bool(pin and rec.get("commit") and rec["commit"] != pin)   # same version, another commit: still an update
         ch = (seen.get("changes") or {}).get(agent)
         rows[agent] = {"package": rec.get("package") or agent, "installed": rec["version"], "latest": latest,

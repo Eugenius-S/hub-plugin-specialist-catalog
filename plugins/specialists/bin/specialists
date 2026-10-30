@@ -205,10 +205,15 @@ def pinned(name):
     return next((str(i.get("commit") or "") for i in load_catalog() if i["name"] == name), "") if name else ""
 
 
-def same_repo(a, b):
-    """Two addresses of one repo (a trailing slash or .git aside)."""
-    norm = lambda u: (u or "").strip().rstrip("/").removesuffix(".git").lower()
-    return bool(a) and norm(a) == norm(b)
+def follows(rec):
+    """Where update takes a package from: (repo, pin). A package from the catalog follows the catalog's address and pin,
+    even when the catalog moved it to another repo (never the old repo's head); a package installed from one's own
+    folder or URL keeps that address and its head."""
+    if rec.get("source") != "own":
+        for item in load_catalog():
+            if item["name"] == rec["package"]:
+                return item["repo"], pinned(rec["package"])
+    return rec.get("repo") or "", ""
 
 
 def text_files(root):
@@ -611,6 +616,7 @@ def cmd_install(args):
             die("the hub did not create the " + ("session" if args.trial else "agent"))
         sess = wait_session(agent)
         rec = {"package": man["name"], "version": man["version"], "repo": repo, "commit": head_of(root),
+               "source": "catalog" if name else "own",
                "session_id": sess["session_id"], "cwd": cwd, "tool_ids": tool_ids(man), "plugins": package_plugins(root), "installed_at": int(time.time())}
         if args.trial:
             rec.update(agent_file=path, trial=True)
@@ -681,7 +687,7 @@ def cmd_adopt(args):
             die(f"package {repo} rejected:\n  - " + "\n  - ".join(bad))
         st = load_state()
         st["installed"][agent] = {"package": man["name"], "version": man["version"], "repo": repo,
-                                  "commit": head_of(root), "session_id": sess["session_id"], "agent_file": path,
+                                  "source": "catalog" if name else "own", "commit": head_of(root), "session_id": sess["session_id"], "agent_file": path,
                                   "cwd": sess.get("cwd") or os.path.abspath(os.path.expanduser(man["agent"]["cwd"])),
                                   "tools": {"asked": [], "missing": []},   # a live agent already has its tools
                                   "tool_ids": tool_ids(man), "plugins": package_plugins(root),
@@ -711,11 +717,7 @@ def cmd_update(args):
     who_may(status)
     st = load_state()
     agent, rec = installed(st, args.name)
-    # the address recorded at install wins: a hub that installed a package from its own repo stays on it even when the
-    # catalog lists a package of that name elsewhere; the catalog's pin applies only to the catalog's own address
-    listed = next((i["repo"] for i in load_catalog() if i["name"] == rec["package"]), "")
-    repo = rec.get("repo") or listed
-    pin = pinned(rec["package"]) if same_repo(repo, listed) else ""
+    repo, pin = follows(rec)
     root, tmp = fetch(repo, pin)
     try:
         man, bad = check(root, hub_version())
