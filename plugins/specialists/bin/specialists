@@ -205,20 +205,37 @@ def pinned(name):
     return next((str(i.get("commit") or "") for i in load_catalog() if i["name"] == name), "") if name else ""
 
 
+def installed_pin(rec):
+    """The full sha a package from the catalog was installed at ("" when the record has none)."""
+    c = str(rec.get("commit") or "")
+    return c if SHA.fullmatch(c) else ""
+
+
+def blind(rec):
+    """A package from the catalog that the catalog says nothing about now (unreadable or empty): there is no pin to
+    follow, and the repo's head is not an answer."""
+    return rec.get("source") != "own" and not any(i["name"] == rec["package"] for i in load_catalog())
+
+
 def follows(rec):
     """Where update takes a package from: (repo, pin). A package from the catalog follows the catalog's address and pin,
-    even when the catalog moved it to another repo (never the old repo's head); a package installed from one's own
-    folder or URL keeps that address and its head."""
+    even when the catalog moved it to another repo (never the old repo's head). When the catalog is unreadable or
+    empty it stays on the commit it was installed at, and with no such commit update is refused: it never takes the
+    head of the repo without a pin. A package installed from one's own folder or URL keeps that address and its head."""
     if rec.get("source") != "own":
         for item in load_catalog():
             if item["name"] == rec["package"]:
                 return item["repo"], pinned(rec["package"])
+        if not installed_pin(rec):
+            die(f"{rec['package']}: the catalog is unreadable or empty and the installed commit is not recorded, "
+                "so there is no pin to update to; not updating without a pin. Try again when the catalog is back.")
+        return rec.get("repo") or "", installed_pin(rec)
     return rec.get("repo") or "", ""
 
 
 def dropped(rec):
     """A package from the catalog that a readable, non-empty catalog no longer holds: there is nothing to follow, and
-    the old repo's head is not the catalog's answer. An unreadable or empty catalog says nothing: as before."""
+    the old repo's head is not the catalog's answer. An unreadable or empty catalog says nothing here: see follows()."""
     if rec.get("source") == "own":
         return False
     items = load_catalog()
@@ -735,6 +752,8 @@ def cmd_update(args):
     if dropped(rec):
         die(dropped_text(agent, rec))
     repo, pin = follows(rec)
+    if blind(rec):
+        say(f"{agent}: the catalog is unreadable or empty, so only the installed commit {pin[:12]} can be used.")
     root, tmp = fetch(repo, pin)
     try:
         man, bad = check(root, hub_version())

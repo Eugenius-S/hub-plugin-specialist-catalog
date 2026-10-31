@@ -562,11 +562,70 @@ class Pinned(Base):
         rec = self.state_file()["installed"]["analyst"]
         self.assertEqual((rec["commit"], rec["version"], rec["repo"]), (self.first, "0.1.0", self.pkg))
 
-    def test_an_unreadable_catalog_is_not_a_dropped_package(self):
+    def go_blind(self, kind):
+        """The two ways the catalog says nothing: the file is gone, or it lists nothing."""
+        if kind == "unreadable":
+            os.remove(sp.CATALOG)
+        else:
+            pathlib.Path(sp.CATALOG).write_text("[]", encoding="utf-8")
+
+    def installed_first(self):
         self.pin(self.first)
         self.install()
+
+    def stays_on_the_installed_commit(self, kind):
+        self.installed_first()
+        self.go_blind(kind)
+        out = self.run_cli("update", "analyst")
+        self.assertNotIn("no longer in the catalog", out)    # cannot tell: not a dropped package
+        self.assertIn("is the latest", out)
+
+    def never_takes_the_head(self, kind):
+        self.installed_first()
+        self.go_blind(kind)
+        self.assertEqual(head(self.pkg), self.second)   # the head is 0.2.0, the installed commit 0.1.0
+        calls = self.git_calls(lambda: self.run_cli("update", "analyst"))
+        self.assertEqual([c for c in calls if "clone" in c], [])
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["commit"], rec["version"]), (self.first, "0.1.0"))
+
+    def refuses_without_a_commit(self, kind):
+        self.installed_first()
+        path = os.path.join(self.state, "specialists", "state.json")
+        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        del data["installed"]["analyst"]["commit"]   # installed by a version that did not record it
+        pathlib.Path(path).write_text(json.dumps(data), encoding="utf-8")
+        self.go_blind(kind)
+        said = []
+        calls = self.git_calls(lambda: said.append(self.fails("update", "analyst")))
+        self.assertIn("not updating without a pin", said[0])
+        self.assertEqual([c for c in calls if "clone" in c or "fetch" in c], [])
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec.get("commit"), rec["version"]), (None, "0.1.0"))
+
+    def test_an_unreadable_catalog_is_not_a_dropped_package(self):
+        self.stays_on_the_installed_commit("unreadable")
+
+    def test_an_empty_catalog_is_not_a_dropped_package(self):
+        self.stays_on_the_installed_commit("empty")
+
+    def test_update_never_takes_the_repo_head_when_the_catalog_is_unreadable(self):
+        self.never_takes_the_head("unreadable")
+
+    def test_update_never_takes_the_repo_head_when_the_catalog_is_empty(self):
+        self.never_takes_the_head("empty")
+
+    def test_update_refuses_without_a_recorded_commit_when_the_catalog_is_unreadable(self):
+        self.refuses_without_a_commit("unreadable")
+
+    def test_update_refuses_without_a_recorded_commit_when_the_catalog_is_empty(self):
+        self.refuses_without_a_commit("empty")
+
+    def test_an_own_package_is_updated_without_a_catalog(self):
+        self.pin(self.first)
+        self.run_cli("install", self.pkg, "--cwd", os.path.join(self.tmp, "work"))
         os.remove(sp.CATALOG)
-        self.assertIn("0.1.0 -> 0.2.0", self.run_cli("update", "analyst"))   # cannot tell: as before
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
 
     def test_an_own_package_stays_when_the_catalog_drops_the_name(self):
         self.pin(self.first)
@@ -760,7 +819,7 @@ class Process(unittest.TestCase):
     def installed(self, agents):
         os.makedirs(os.path.join(proc.STATE, "specialists"), exist_ok=True)
         with open(os.path.join(proc.STATE, "specialists", "state.json"), "w", encoding="utf-8") as f:
-            json.dump({"installed": {a: {"package": p, "version": v, "repo": "https://example.invalid/" + p}
+            json.dump({"installed": {a: {"package": p, "version": v, "repo": "https://example.invalid/" + p, "commit": "a" * 40}
                                      for a, (p, v) in agents.items()}}, f)
 
     def test_newer_compares_numbers_not_strings(self):
@@ -807,6 +866,36 @@ class Process(unittest.TestCase):
         seen = []
         proc.check_all(now=1, probe=lambda repo, commit="": seen.append((repo, commit)) or ("0.1.0", ""))
         self.assertEqual(seen, [("https://example.invalid/mine", "")])
+
+    def blind_catalog(self, kind):
+        if kind == "empty":
+            with open(proc.CATALOG, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        else:
+            self.assertFalse(os.path.exists(proc.CATALOG))   # unreadable: there is no file
+
+    def test_an_unreadable_or_empty_catalog_is_checked_at_the_installed_commit_only(self):
+        for kind in ("unreadable", "empty"):
+            with self.subTest(kind):
+                self.blind_catalog(kind)
+                seen = []
+                proc.check_all(now=1, probe=lambda repo, commit="": seen.append((repo, commit)) or ("0.1.0", ""))
+                self.assertIn(("https://example.invalid/analyst", "a" * 40), seen)   # exactly where it was installed
+                self.assertNotIn(("https://example.invalid/analyst", ""), seen)      # never the repo's head
+
+    def test_an_unreadable_or_empty_catalog_without_a_recorded_commit_is_not_asked(self):
+        for kind in ("unreadable", "empty"):
+            with self.subTest(kind):
+                with open(os.path.join(proc.STATE, "specialists", "state.json"), "w", encoding="utf-8") as f:
+                    json.dump({"installed": {"analyst": {"package": "analyst", "version": "0.1.0",
+                                                         "repo": "https://example.invalid/analyst"}}}, f)
+                self.blind_catalog(kind)
+                seen = []
+                proc.check_all(now=1, probe=lambda repo, commit="": seen.append((repo, commit)) or ("0.9.0", ""))
+                self.assertEqual(seen, [])   # no pin to ask at: the head is not an answer
+                row = proc.build()["rows"]["analyst"]
+                self.assertFalse(row["update"])
+                self.assertIn("without a pin", row["error"])
 
     def test_installed_version_follows_state_without_a_new_check(self):
         proc.check_all(now=1, probe=lambda repo, commit="": ("0.2.0", ""))

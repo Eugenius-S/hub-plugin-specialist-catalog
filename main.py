@@ -55,14 +55,32 @@ def installed():
     return {a: v for a, v in (got or {}).items() if isinstance(v, dict) and v.get("version")}
 
 
+def installed_pin(rec):
+    """The full sha a package from the catalog was installed at ("" when the record has none)."""
+    c = str(rec.get("commit") or "")
+    return c if SHA.fullmatch(c) else ""
+
+
+def in_catalog(package):
+    return any(isinstance(i, dict) and i.get("name") == package and i.get("repo") for i in read_json(CATALOG, []))
+
+
+def blind(rec):
+    """As `specialists update`: a package from the catalog that the catalog says nothing about now (unreadable or
+    empty) and that has no installed commit to stay on: update is refused, so there is nothing to ask about."""
+    return rec.get("source") != "own" and not in_catalog(rec.get("package") or "") and not installed_pin(rec)
+
+
 def follows(rec):
     """As `specialists update`: (repo, pin). A package from the catalog follows the catalog's address and pin, even
-    when the catalog moved it to another repo; a package installed from one's own address keeps that address, no pin."""
+    when the catalog moved it to another repo; when the catalog says nothing it stays on the installed commit, never
+    the head of the repo. A package installed from one's own address keeps that address, no pin."""
     package = rec.get("package") or ""
     if rec.get("source") != "own":
         for item in read_json(CATALOG, []):
             if isinstance(item, dict) and item.get("name") == package and item.get("repo"):
                 return item["repo"], catalog_commit(package)
+        return rec.get("repo") or "", installed_pin(rec)
     return rec.get("repo") or "", ""
 
 
@@ -230,6 +248,9 @@ def check_all(now=None, probe=latest_version, diff=changes_of):
     got, seen = {}, {}
 
     def one(key, rec):
+        if blind(rec):
+            got[key] = {"version": "", "error": "the catalog is unreadable or empty: not asking without a pin"}
+            return
         version, err = probe(*follows(rec))
         got[key] = {"version": version, "error": err}
 
