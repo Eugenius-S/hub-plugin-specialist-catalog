@@ -373,22 +373,25 @@ def heading_lines(lines):
 
 
 def local_blocks(text):
-    """[(the "## " section the block stood in, None before the first; the block with its markers)] in file order."""
+    """[(where the block stood; the block with its markers)] in file order. Where: the "## " heading text of its section,
+    None between the first heading and the first "## " (the head under the title), "" before any heading."""
     found, pos = [], 0
     while (a := text.find(LOCAL_OPEN, pos)) >= 0:
         b = text.find(LOCAL_CLOSE, a)
         if b < 0:
             break
         b += len(LOCAL_CLOSE)
-        prev = [h for h in heading_lines(text[:a].split("\n")) if h[1] == 2]
-        found.append((prev[-1][2] if prev else None, text[a:b]))
+        heads = heading_lines(text[:a].split("\n"))
+        prev = [h for h in heads if h[1] == 2]
+        found.append((prev[-1][2] if prev else None if heads else "", text[a:b]))
         pos = b
     return found
 
 
 def carry_local(body, agent_file):
     """(new text, whether blocks were carried): each local block of the agent file goes to the end of the same "## "
-    section of the new package profile; no such section (or the block stood before the first) — to the end, in order."""
+    section of the new package profile; a block that stood in the head (under the title, before the first "## ") stays
+    there, one before any heading stays first; no such section — to the end, in order."""
     try:
         with open(agent_file, encoding="utf-8") as f:
             blocks = local_blocks(f.read())
@@ -398,19 +401,30 @@ def carry_local(body, agent_file):
         return body, False
     lines = body.rstrip("\n").split("\n")
     heads = heading_lines(lines)
-    inserts, tail = {}, []                               # the line to insert before -> blocks
+    inserts, tail, top = {}, [], []                      # the line to insert before -> blocks
     for anchor, block in blocks:
-        at = next((k for k, h in enumerate(heads) if h[1] == 2 and h[2] == anchor), None) if anchor else None
-        if at is None:
+        if anchor == "":                                 # before any heading: first in the file
+            top.append(block)
+            continue
+        if anchor is None:                               # the head: ends where the first "## " begins
+            first = next((k for k, h in enumerate(heads) if h[1] == 2), None)
+            end = None if first is None else heads[first][0]
+            floor = 0 if first is None or first == 0 else heads[first - 1][0] + 1
+        else:
+            at = next((k for k, h in enumerate(heads) if h[1] == 2 and h[2] == anchor), None)
+            end = None if at is None else next((h[0] for h in heads[at + 1:]), len(lines))
+            floor = None if at is None else heads[at][0] + 1
+        if end is None:
             tail.append(block)
             continue
-        end = next((h[0] for h in heads[at + 1:]), len(lines))
-        while end > heads[at][0] + 1 and not lines[end - 1].strip():
+        while end > floor and not lines[end - 1].strip():
             end -= 1
         inserts.setdefault(end, []).append(block)
     for end in sorted(inserts, reverse=True):
         add = [x for block in inserts[end] for x in ("", *block.split("\n"))]
         lines[end:end] = add + ([""] if end < len(lines) else [])
+    if top:
+        lines[0:0] = [x for block in top for x in (*block.split("\n"), "")]
     return "\n".join(lines) + "".join("\n\n" + block for block in tail) + "\n", True
 
 

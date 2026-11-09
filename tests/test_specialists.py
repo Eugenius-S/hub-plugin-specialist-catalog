@@ -378,6 +378,35 @@ class UpdateRemove(Base):
         self.assertLess(text.index("my own line"), text.index("## End"))   # stays in its section
         self.assertTrue(os.path.isfile(sp.profile_path("analyst", ".prev")))
 
+    def test_update_keeps_the_local_head_block_at_the_top(self):
+        self.install()
+        rec = self.state_file()["installed"]["analyst"]
+        path = pathlib.Path(rec["agent_file"])
+        local = lambda t: f"{sp.LOCAL_OPEN}\n{t}\n{sp.LOCAL_CLOSE}"   # noqa: E731
+        path.write_text(f"# analyst\n\n{local('head after title')}\n\n## Notes\nold\n\n{local('in notes')}\n\n## End\nx\n",
+                        encoding="utf-8")
+        package(self.pkg, man={**MAN, "version": "0.2.0"}, claude=CLAUDE + "\n## Notes\nnew text\n\n## End\nx\n")
+        commit(self.pkg, "0.2.0")
+        self.run_cli("update", "analyst")
+        text = path.read_text(encoding="utf-8")
+        i = {k: text.index(k) for k in ("# analyst", "head after title", "## Notes", "in notes", "## End")}
+        self.assertLess(i["# analyst"], i["head after title"])
+        self.assertLess(i["head after title"], i["## Notes"])          # the head block stays before the first "## "
+        self.assertLess(i["## Notes"], i["in notes"])
+        self.assertLess(i["in notes"], i["## End"])                    # a block inside a section stays there
+        self.assertEqual(text.count("head after title"), 1)
+
+    def test_update_keeps_a_block_before_the_title_first(self):
+        self.install()
+        path = pathlib.Path(self.state_file()["installed"]["analyst"]["agent_file"])
+        path.write_text(f"{sp.LOCAL_OPEN}\npath line\n{sp.LOCAL_CLOSE}\n\n# analyst\n\n## Notes\nold\n", encoding="utf-8")
+        package(self.pkg, man={**MAN, "version": "0.2.0"}, claude=CLAUDE + "\n## Notes\nnew text\n")
+        commit(self.pkg, "0.2.0")
+        self.run_cli("update", "analyst")
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(text.index(sp.LOCAL_OPEN), 0)
+        self.assertLess(text.index("path line"), text.index("# analyst"))
+
     def test_update_asks_new_tools(self):
         self.install("--tools", "none")
         tools = {"need": [{"id": "research", "why": "x"}, {"id": "brand-new", "why": "y"}], "optional": []}
