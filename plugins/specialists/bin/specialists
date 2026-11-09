@@ -22,6 +22,8 @@ a CLAUDE.md profile and eval cases).
 Only the hub or the owner installs: `hub session new` from a working session is just a request to the hub.
 The plugin never writes the hub's settings or another component's files: the agent file is written by the agent itself
 on request, the plugin only reads it back. Its own files: <hub state>/specialists/ (state.json, profiles/, trial/).
+A package may lie in a subfolder of a repo: `<git-url>#<folder>` wherever an address is taken (install, adopt, the catalog).
+git never asks anything (no prompt, no credential-manager window) and has a time limit (SPECIALISTS_GIT_WAIT).
 The catalog is a JSON list [{name, repo, version, icon?, about?}]: the `catalog` setting of the plugin, SPECIALISTS_CATALOG
 or specialists.json next to the plugin. Stdlib only."""
 import argparse
@@ -154,9 +156,51 @@ def load_catalog():
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
+GIT_WAIT = float(os.environ.get("SPECIALISTS_GIT_WAIT", "120"))   # s: one git call; a silent server is a reason, not a hang
+# What a private server says when the login is missing or the account may not read the repo (GitLab answers "not found" too)
+NO_ACCESS = re.compile(r"terminal prompts disabled|could not read (?:Username|Password)|Authentication failed|"
+                       r"Access denied|Permission denied|returned error: 40[134]|Could not read from remote|"
+                       r"repository .* not found|don't have permission|Invalid username or password", re.I)
+GITROOT = {}   # package folder inside a clone -> (the clone, the subfolder): head_of() and the stamp need the clone
+
+
 def git(*args, cwd=None):
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    """git that never asks anything: no prompt in the terminal, no login window of the credential manager, and a time
+    limit. A call that ran out of time answers like a failed one (code 124), the reason in stderr."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              env=env, timeout=GIT_WAIT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(["git", *args], 124, "", f"TIMEOUT: git did not answer within {GIT_WAIT:g} s")
+
+
+def hide_login(text):
+    """An address with a password or a token in it (https://user:token@host/...) never goes into a message."""
+    return re.sub(r"(://)[^/@\s]+@", r"\1***@", text)
+
+
+def split_address(spec):
+    """'<repo>#<subfolder>' -> (repo, subfolder); the subfolder is a relative path inside the repo, or ""."""
+    if "#" not in spec:
+        return spec, ""
+    repo, _, sub = spec.rpartition("#")
+    sub = sub.strip("/")
+    parts = sub.split("/")
+    if not sub or any(x in ("", ".", "..") or ":" in x or "\\" in x for x in parts) or sub.startswith("-"):
+        die(f"bad subfolder \"{sub}\" in {hide_login(spec)}: a path inside the repo, like hub/specialists/analyst")
+    return repo, sub
+
+
+def fail_text(repo, err):
+    """Why a fetch failed, in words the owner can act on."""
+    err = hide_login(err.strip())
+    if err.startswith("TIMEOUT"):
+        return (f"the server did not answer within {GIT_WAIT:g} s (it may be waiting for a login, a private repo needs "
+                f"your account: ask for read access to the repo)")
+    if NO_ACCESS.search(err):
+        return "no access to the repo: ask for read access to it (and sign in to git on this machine)"
+    return err[:300]
 
 
 def fetch_commit(src, commit, to):
@@ -175,15 +219,20 @@ def fetch_commit(src, commit, to):
 
 def fetch(repo, commit=""):
     """The package folder: a git repo (local or remote) is cloned fresh into a temp folder, at `commit` when the catalog
-    pins one; a plain folder is used as is. (folder, temp folder to remove afterwards or False)."""
-    local = os.path.expanduser(repo)
+    pins one; a plain folder is used as is. `repo#folder/in/repo` takes the package from a subfolder of the repo (the
+    pin is the commit of the whole repo). (folder, temp folder to remove afterwards or False)."""
+    whole, sub = split_address(repo)
+    local = os.path.expanduser(whole)
     if commit and not SHA.fullmatch(commit):
-        die(f"the catalog pins {repo} to \"{commit}\": a full commit sha (40 hex digits) is needed")
+        die(f"the catalog pins {hide_login(repo)} to \"{commit}\": a full commit sha (40 hex digits) is needed")
     if os.path.isdir(local) and not os.path.isdir(os.path.join(local, ".git")):
         if commit:
             die(f"{repo} is a plain folder: it cannot be pinned to commit {commit[:12]}")
-        return os.path.abspath(local), False
-    src = os.path.abspath(local) if os.path.isdir(local) else repo
+        root = os.path.join(os.path.abspath(local), *sub.split("/")) if sub else os.path.abspath(local)
+        if sub and not os.path.isdir(root):
+            die(f"no subfolder {sub} in {repo}")
+        return root, False
+    src = os.path.abspath(local) if os.path.isdir(local) else whole
     tmp = tempfile.mkdtemp(prefix="specialist-")
     to = os.path.join(tmp, "pkg")
     if commit:
@@ -193,13 +242,32 @@ def fetch(repo, commit=""):
         err = out.stderr.strip() if out.returncode else ""
     if err:
         rmtree_force(tmp)
-        die(f"cannot fetch package {repo}: {err[:300]}")
-    return to, tmp
+        die(f"cannot fetch package {hide_login(repo)}: {fail_text(repo, err)}")
+    if not sub:
+        return to, tmp
+    root = os.path.join(to, *sub.split("/"))
+    if not os.path.isdir(root) or not os.path.realpath(root).startswith(os.path.realpath(to) + os.sep):
+        rmtree_force(tmp)
+        die(f"no subfolder {sub} in {hide_login(whole)} (the subfolder must be a folder of the repo, not a link out of it)")
+    GITROOT[root] = (to, sub)
+    return root, tmp
 
 
 def head_of(root):
-    """The commit of a fetched package ("" for a plain folder)."""
-    return git("-C", root, "rev-parse", "HEAD").stdout.strip() if os.path.isdir(os.path.join(root, ".git")) else ""
+    """The commit of a fetched package ("" for a plain folder); for a subfolder, the commit of the whole repo."""
+    clone = GITROOT.get(root, (root, ""))[0]
+    return git("-C", clone, "rev-parse", "HEAD").stdout.strip() if os.path.isdir(os.path.join(clone, ".git")) else ""
+
+
+def stamp_of(root, man):
+    """What the package folder is marked with: the commit; for a subfolder the id of that folder's content (a commit
+    that changed only other folders of the repo is not a new package folder)."""
+    clone, sub = GITROOT.get(root, (root, ""))
+    if sub:
+        tree = git("-C", clone, "rev-parse", f"HEAD:{sub}").stdout.strip()
+        if tree:
+            return tree
+    return head_of(root) or man["version"]
 
 
 def pinned(name):
@@ -416,7 +484,7 @@ def put_folder(agent, rec, root, man):
         rec.pop("folder", None)
         return say(f"{agent}: package folder NOT updated ({err}); the old one is kept, the next "
                    f"`specialists update {agent}` tries again: {packages_dir(agent)}")
-    rec["folder"] = head_of(root) or man["version"]
+    rec["folder"] = stamp_of(root, man)
     say(f"{agent}: package folder {packages_dir(agent)} is at {man['version']}")
 
 
@@ -655,7 +723,8 @@ def notify(to, text, quiet):
 
 def find(spec):
     """A catalog entry or a link of one's own: (package name or None, repo)."""
-    if os.path.isdir(os.path.expanduser(spec)) or re.match(r"^[a-z]+://|^git@|\.git$", spec):
+    whole = spec.rpartition("#")[0] if "#" in spec else spec
+    if os.path.isdir(os.path.expanduser(whole)) or re.match(r"^[a-z]+://|^git@|\.git$", whole):
         return None, spec
     for item in load_catalog():
         if item["name"] == spec:
@@ -842,7 +911,7 @@ def cmd_update(args):
         if bad:
             die(f"the new version of {repo} is rejected:\n  - " + "\n  - ".join(bad))
         if man["version"] == rec["version"] and (not pin or rec.get("commit") in ("", None, pin)):
-            if not rec.get("trial") and rec.get("folder") != (head_of(root) or man["version"]):
+            if not rec.get("trial") and rec.get("folder") != stamp_of(root, man):
                 put_folder(agent, rec, root, man)   # the folder fell behind (an older plugin, a failed swap)
                 save_state(st)
             return say(f"{agent}: version {rec['version']} is the latest")

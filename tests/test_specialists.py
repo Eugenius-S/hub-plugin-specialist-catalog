@@ -816,6 +816,188 @@ class Pinned(Base):
             self.assertFalse(os.path.exists(marker))
 
 
+class Subdir(Base):
+    """A package inside a git repo: `<git-url>#<subdir>` (one repo holds several packages, one folder per agent)."""
+
+    SUB = "hub/specialists/analyst"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "mono")
+        os.makedirs(os.path.join(self.repo, "server"))
+        pathlib.Path(self.repo, "server", "big.txt").write_text("the site, not the package\n", encoding="utf-8")
+        pathlib.Path(self.repo, "hub-plugin.json").write_text("{not a package}", encoding="utf-8")   # the root is not it
+        package(os.path.join(self.repo, self.SUB), claude=CLAUDE + "first\n")
+        package(os.path.join(self.repo, "hub/specialists/other"), man=dict(MAN, name="other"), claude="# other\n")
+        commit(self.repo, "first")
+        self.first = head(self.repo)
+        self.addr = f"{self.repo}#{self.SUB}"
+
+    def pin(self, sha="", repo=None):
+        with open(sp.CATALOG, "w", encoding="utf-8") as f:
+            json.dump([{"name": "analyst", "repo": repo or self.addr, "version": "0.1.0", **({"commit": sha} if sha else {})}], f)
+
+    def put(self, version, text):
+        package(os.path.join(self.repo, self.SUB), man=dict(MAN, version=version), claude=CLAUDE + text)
+        commit(self.repo, text)
+
+    def install_addr(self, addr=None):
+        return self.run_cli("install", addr or self.addr, "--cwd", os.path.join(self.tmp, "work"))
+
+    def test_install_from_a_subfolder(self):
+        self.install_addr()
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["version"], rec["source"], rec["repo"], rec["commit"]), ("0.1.0", "own", self.addr, self.first))
+        self.assertIn("first", pathlib.Path(self.hub.agent_file("analyst")).read_text(encoding="utf-8"))
+
+    def test_the_package_folder_holds_the_subfolder_only(self):
+        self.install_addr()
+        folder = os.path.join(self.state, "specialists", "packages", "analyst")
+        self.assertTrue(os.path.isfile(os.path.join(folder, "hub-plugin.json")))
+        self.assertTrue(os.path.isfile(os.path.join(folder, "CLAUDE.md")))
+        self.assertFalse(os.path.exists(os.path.join(folder, "server")))
+        self.assertFalse(os.path.exists(os.path.join(folder, "hub")))
+
+    def test_update_follows_the_same_subfolder(self):
+        self.install_addr()
+        self.put("0.2.0", "second\n")
+        self.run_cli("update", "analyst")
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["version"], rec["repo"]), ("0.2.0", self.addr))
+        self.assertIn("second", pathlib.Path(self.hub.agent_file("analyst")).read_text(encoding="utf-8"))
+
+    def test_a_change_outside_the_subfolder_is_not_an_update(self):
+        self.install_addr()
+        pathlib.Path(self.repo, "server", "big.txt").write_text("changed\n", encoding="utf-8")
+        commit(self.repo, "site only")
+        sent = len(self.sends())
+        out = self.run_cli("update", "analyst")
+        self.assertIn("is the latest", out)
+        self.assertNotIn("package folder", out)           # the package's own files are the same: nothing to copy
+        self.assertEqual(len(self.sends()), sent)
+
+    def test_the_catalog_may_point_into_a_subfolder_and_pin_a_commit(self):
+        self.put("0.2.0", "second\n")
+        self.pin(self.first)
+        self.run_cli("install", "analyst", "--cwd", os.path.join(self.tmp, "work"))
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["version"], rec["commit"], rec["source"]), ("0.1.0", self.first, "catalog"))
+        self.pin(head(self.repo))
+        self.run_cli("update", "analyst")
+        self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.2.0")
+
+    def test_a_missing_subfolder_installs_nothing(self):
+        out = self.fails("install", f"{self.repo}#hub/specialists/nope", "--cwd", os.path.join(self.tmp, "w"))
+        self.assertIn("hub/specialists/nope", out)
+        self.assertEqual(self.hub.sessions, {})
+
+    def test_a_subfolder_may_not_leave_the_repo(self):
+        os.symlink(self.tmp, os.path.join(self.repo, "link"))
+        commit(self.repo, "link")
+        for bad in ("..", "../pkg", "hub/../..", "/etc", "link", "a\\b", "C:/x", "./."):
+            out = self.fails("install", f"{self.repo}#{bad}", "--cwd", os.path.join(self.tmp, "w"))
+            self.assertIn("subfolder", out, bad)
+        self.assertEqual(self.hub.sessions, {})
+
+    def test_a_remote_url_with_a_subfolder_is_a_link_of_ones_own(self):
+        url = "https://gitlab.example.com/team/repo.git#hub/specialists/x"
+        self.assertEqual(sp.find(url), (None, url))
+        self.assertEqual(sp.find(self.addr), (None, self.addr))
+
+    def test_adopt_takes_a_subfolder(self):
+        self.hub.sessions["analyst"] = {"state": "idle", "session_id": "sid-analyst", "kind": "work", "role": "agent"}
+        os.makedirs(os.path.dirname(self.hub.agent_file("analyst")))
+        pathlib.Path(self.hub.agent_file("analyst")).write_text("# by hand\n", encoding="utf-8")
+        self.run_cli("adopt", "analyst", self.addr)
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["repo"], rec["commit"]), (self.addr, self.first))
+
+    def test_the_process_reads_the_version_inside_the_subfolder(self):
+        self.put("0.7.0", "second\n")
+        self.assertEqual(proc.latest_version(self.addr), ("0.7.0", ""))
+        self.assertEqual(proc.latest_version(self.addr, self.first), ("0.1.0", ""))
+        self.assertTrue(proc.latest_version(f"{self.repo}#hub/specialists/nope")[1])
+
+    def test_the_process_diff_reads_the_profile_inside_the_subfolder(self):
+        self.put("0.2.0", "second\n")
+        rec = {"commit": self.first, "tool_ids": [], "plugins": []}
+        got = proc.changes_of(self.addr, head(self.repo), rec)
+        self.assertEqual(got["profile"]["added"], 1)
+        self.assertIn("+second", got["profile"]["lines"])
+
+
+class GitAccess(Base):
+    """A private repo on a server that asks for a login: no windows, no hang, a clear reason."""
+
+    def spy(self, work, fake=None):
+        """env and timeout of every git run while `work` goes; `fake(cmd)` may answer instead of git."""
+        calls, real = [], subprocess.run
+
+        def run(cmd, *a, **kw):
+            if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "git":
+                calls.append((list(cmd), kw))
+                if fake and fake(cmd) is not None:
+                    return fake(cmd)
+            return real(cmd, *a, **kw)
+        subprocess.run = run
+        try:
+            work()
+        finally:
+            subprocess.run = real
+        return calls
+
+    def talk(self, repo="https://gitlab.example.com/team/repo.git", sha="", sub=""):
+        try:
+            sp.fetch(repo + (f"#{sub}" if sub else ""), sha)
+        except SystemExit as e:
+            return str(e)
+
+    def refuse(self, text, code=128):
+        return lambda cmd: subprocess.CompletedProcess(cmd, code, "", text) if any(x in cmd for x in ("clone", "fetch")) else None
+
+    def test_git_never_asks_and_never_hangs(self):
+        calls = self.spy(lambda: self.talk(), self.refuse("fatal: nope"))
+        self.assertTrue(calls)
+        for cmd, kw in calls:
+            self.assertEqual(kw["env"]["GIT_TERMINAL_PROMPT"], "0", cmd)
+            self.assertEqual(kw["env"]["GCM_INTERACTIVE"], "never", cmd)
+            self.assertTrue(kw.get("timeout"), cmd)
+
+    def test_no_access_is_said_in_words(self):
+        for text in ("fatal: could not read Username for 'https://gitlab.example.com': terminal prompts disabled",
+                     "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://gitlab.example.com/x.git/'",
+                     "fatal: unable to access 'https://gitlab.example.com/x.git/': The requested URL returned error: 403",
+                     "git@gitlab.example.com: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+                     "remote: The project you were looking for could not be found or you don't have permission to view it.\n"
+                     "fatal: repository 'https://gitlab.example.com/x.git/' not found"):
+            for sha in ("", "a" * 40):
+                got = []
+                self.spy(lambda: got.append(self.talk(sha=sha)), self.refuse(text))
+                self.assertIn("no access", got[0], text)
+                self.assertIn("read access", got[0], text)
+
+    def test_other_failures_keep_git_words(self):
+        got = []
+        self.spy(lambda: got.append(self.talk()), self.refuse("fatal: unable to access: Could not resolve host: gitlab.example.com"))
+        self.assertIn("Could not resolve host", got[0])
+        self.assertNotIn("no access", got[0])
+
+    def test_a_silent_server_is_a_timeout_not_a_hang(self):
+        def hang(cmd):
+            if any(x in cmd for x in ("clone", "fetch")):
+                raise subprocess.TimeoutExpired(cmd, 1)
+        got = []
+        self.spy(lambda: got.append(self.talk()), hang)
+        self.assertIn("did not answer", got[0])
+        self.assertIn("read access", got[0])     # the usual cause: a login that was never given
+
+    def test_a_password_in_the_address_is_not_printed(self):
+        got = []
+        self.spy(lambda: got.append(self.talk("https://oauth2:glpat-SECRET123456@gitlab.example.com/x.git")),
+                 self.refuse("fatal: Authentication failed for 'https://oauth2:glpat-SECRET123456@gitlab.example.com/x.git/'"))
+        self.assertNotIn("SECRET123456", got[0])
+
+
 class HubCommand(unittest.TestCase):
     """The hub command: SPECIALISTS_HUB first, then shutil.which (hub.cmd on Windows), then HUB_NESTED_*."""
     def setUp(self):

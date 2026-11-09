@@ -24,6 +24,15 @@ the plugin reads it back. Equal to the profile: the agent is restarted with it a
 are requested from the hub (`hub tools grant`); a risky tool waits for the owner's yes (a card). A taken name is a refusal
 with a hint to use `--name`. Only the hub or the owner installs.
 
+**A package inside a repo.** One repo may hold several packages, one folder per agent: `<git-url>#<folder>`, for example
+`specialists install https://gitlab.example.com/team/site.git#hub/specialists/smm-insta`. The same form works in `adopt`
+and in the catalog's `repo`; `update` follows the same folder (the pin is the commit of the whole repo, a commit that
+changed only other folders does not touch the package folder). The folder must lie inside the repo (`..`, an absolute
+path or a link out of it is refused). Git runs without questions: no prompt, no login window of the credential manager,
+a time limit (`SPECIALISTS_GIT_WAIT`, 120 s). A private repo that the account may not read ends with "no access to the
+repo: ask for read access to it", a server that stays silent with "did not answer"; a password in an address is never
+printed.
+
 **adopt** puts under the catalog an agent that already lives in the hub but was installed around it (by hand or on another
 machine): a record like install's (package, version, agent file, folder). The agent's `CLAUDE.md` and tools are left as
 they are, the session is not restarted. The default package is the one with the agent's name. Refused: no such session, it

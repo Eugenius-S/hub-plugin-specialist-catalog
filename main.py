@@ -121,7 +121,18 @@ def newer(latest, have):
 
 def git(*args, cwd=None):
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=CLONE_WAIT, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                          timeout=CLONE_WAIT, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
+
+
+def split(repo):
+    """'<repo>#<folder in the repo>' -> (repo, 'folder/in/repo/' or ''): where the package lies, as the CLI reads it."""
+    if "#" not in repo:
+        return repo, ""
+    whole, _, sub = repo.rpartition("#")
+    sub = sub.strip("/")
+    if not sub or any(x in ("", ".", "..") or ":" in x or "\\" in x for x in sub.split("/")):
+        return whole, "?bad/"
+    return whole, sub + "/"
 
 
 def source(repo):
@@ -148,9 +159,10 @@ def fetch_commit(src, commit, to):
 def latest_version(repo, commit=""):
     """(version, '') or ('', reason): the manifest's version in the pinned commit, else in the repo's last commit,
     without the package's other files."""
+    repo, sub = split(repo)
     src, plain = source(repo)
     if plain:
-        return ("", "a pinned package must be a git repo") if commit else manifest_version(os.path.join(src, "hub-plugin.json"))
+        return ("", "a pinned package must be a git repo") if commit else manifest_version(os.path.join(src, sub, "hub-plugin.json"))
     tmp = tempfile.mkdtemp(prefix="specialists-check-")
     try:
         if commit:
@@ -163,7 +175,7 @@ def latest_version(repo, commit=""):
             if out.returncode:
                 return "", (out.stderr.strip().splitlines() or ["git clone failed"])[-1][:200]
             ref = "HEAD"
-        show = git("-C", tmp + "/r", "show", f"{ref}:hub-plugin.json")
+        show = git("-C", tmp + "/r", "show", f"{ref}:{sub}hub-plugin.json")
         if show.returncode:
             return "", "no hub-plugin.json in the package"
         return manifest_version(None, show.stdout)
@@ -194,8 +206,9 @@ def tool_names(text):
 def changes_of(repo, commit, rec):
     """What `specialists update` changes in the profile: CLAUDE.md lines, tools, plugins; None when it cannot be told.
     The installed commit is the base; a record without one has no profile diff, only the new side."""
+    repo, sub = split(repo)
     src, plain = source(repo)
-    if plain or not commit:
+    if plain or not commit or sub.startswith("?"):
         return None
     base = rec.get("commit") or ""
     tmp = tempfile.mkdtemp(prefix="specialists-diff-")
@@ -203,8 +216,8 @@ def changes_of(repo, commit, rec):
         if fetch_commit(src, commit, tmp + "/r"):
             return None
         at = lambda ref, path: (lambda o: o.stdout if not o.returncode else "")(git("-C", tmp + "/r", "show", f"{ref}:{path}"))
-        tools = tool_names(at(commit, "hub-plugin.json"))
-        plugins = plugin_names(at(commit, ".claude-plugin/marketplace.json"))
+        tools = tool_names(at(commit, sub + "hub-plugin.json"))
+        plugins = plugin_names(at(commit, sub + ".claude-plugin/marketplace.json"))
         out = {"base": base, "to": commit,
                "tools": {"added": [t for t in tools if t not in (rec.get("tool_ids") or [])],
                          "removed": [t for t in (rec.get("tool_ids") or []) if t not in tools]},
@@ -212,13 +225,13 @@ def changes_of(repo, commit, rec):
                            "removed": [p for p in (rec.get("plugins") or []) if p not in plugins]}}
         have = bool(base) and not git("-C", tmp + "/r", "fetch", "-q", "--depth", "1", "--no-tags", "--", src, base).returncode
         if have:
-            d = git("-C", tmp + "/r", "diff", "--no-color", "--unified=0", base, commit, "--", "CLAUDE.md").stdout
+            d = git("-C", tmp + "/r", "diff", "--no-color", "--unified=0", base, commit, "--", sub + "CLAUDE.md").stdout
             lines = [l[:200] for l in d.splitlines() if l[:1] in "+-" and not l.startswith(("+++", "---"))]
             out["profile"] = {"known": True, "added": sum(l[0] == "+" for l in lines),
                               "removed": sum(l[0] == "-" for l in lines), "lines": lines[:DIFF_LINES],
                               "more": max(0, len(lines) - DIFF_LINES)}
         else:
-            out["profile"] = {"known": False, "added": len(at(commit, "CLAUDE.md").splitlines()), "removed": 0,
+            out["profile"] = {"known": False, "added": len(at(commit, sub + "CLAUDE.md").splitlines()), "removed": 0,
                               "lines": [], "more": 0}
         return out
     except (OSError, subprocess.SubprocessError):

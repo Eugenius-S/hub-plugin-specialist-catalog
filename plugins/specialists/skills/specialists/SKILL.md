@@ -17,6 +17,8 @@ python3 "${CLAUDE_PLUGIN_ROOT}/bin/specialists" update <agent>
 python3 "${CLAUDE_PLUGIN_ROOT}/bin/specialists" remove <agent>
 ```
 
+- A package inside a repo: `<git-url>#<folder>` (install, adopt, the catalog's `repo`); update follows the same folder.
+- "No access to the repo": the account may not read it; the owner asks for read access, then run the command again.
 - "Package not accepted": the reason is in the output (manifest fields, leaks). The package's author fixes it, not you.
 - "Name taken": pick another name with `--name`; no duplicates.
 - The profile: install and update ask the agent to put the package profile into its agent file and check it. `NOT READY`
