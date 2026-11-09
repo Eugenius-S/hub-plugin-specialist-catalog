@@ -144,12 +144,15 @@ def source(repo):
 
 
 def fetch_commit(src, commit, to):
-    """The commit by itself into `to` (shallow; a server that refuses a bare sha gets all branches). "" or the reason."""
+    """The commit by itself into `to` (shallow; a server that refuses a bare sha gets all branches). "" or the reason.
+    Blobless: only the files read later (`git show`, `git diff`) come over the wire, the repo may be large."""
     out = git("init", "-q", to)
+    if not out.returncode:
+        out = git("-C", to, "remote", "add", "origin", src)
     if out.returncode:
         return (out.stderr.strip().splitlines() or ["git init failed"])[-1][:200]
-    for cmd in (("fetch", "-q", "--depth", "1", "--no-tags", "--", src, commit),
-                ("fetch", "-q", "--no-tags", "--", src, "+refs/heads/*:refs/remotes/origin/*")):
+    for cmd in (("fetch", "-q", "--depth", "1", "--no-tags", "--filter=blob:none", "--", "origin", commit),
+                ("fetch", "-q", "--no-tags", "--filter=blob:none", "--", "origin", "+refs/heads/*:refs/remotes/origin/*")):
         out = git("-C", to, *cmd)
         if not out.returncode and not git("-C", to, "cat-file", "-e", commit + "^{commit}").returncode:
             return ""
@@ -223,7 +226,8 @@ def changes_of(repo, commit, rec):
                          "removed": [t for t in (rec.get("tool_ids") or []) if t not in tools]},
                "plugins": {"added": [p for p in plugins if p not in (rec.get("plugins") or [])],
                            "removed": [p for p in (rec.get("plugins") or []) if p not in plugins]}}
-        have = bool(base) and not git("-C", tmp + "/r", "fetch", "-q", "--depth", "1", "--no-tags", "--", src, base).returncode
+        have = bool(base) and not git("-C", tmp + "/r", "fetch", "-q", "--depth", "1", "--no-tags", "--filter=blob:none", "--", "origin",
+                                     base).returncode
         if have:
             d = git("-C", tmp + "/r", "diff", "--no-color", "--unified=0", base, commit, "--", sub + "CLAUDE.md").stdout
             lines = [l[:200] for l in d.splitlines() if l[:1] in "+-" and not l.startswith(("+++", "---"))]

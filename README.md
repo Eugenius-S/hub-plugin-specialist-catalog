@@ -28,7 +28,8 @@ with a hint to use `--name`. Only the hub or the owner installs.
 `specialists install https://gitlab.example.com/team/site.git#hub/specialists/smm-insta`. The same form works in `adopt`
 and in the catalog's `repo`; `update` follows the same folder (the pin is the commit of the whole repo, a commit that
 changed only other folders does not touch the package folder). The folder must lie inside the repo (`..`, an absolute
-path or a link out of it is refused). Git runs without questions: no prompt, no login window of the credential manager,
+path or a link out of it is refused). Only that folder comes over the wire: a sparse, blobless, history-free clone,
+so a large repo with other things in it costs the package's files, not the whole repo. Git runs without questions: no prompt, no login window of the credential manager,
 a time limit (`SPECIALISTS_GIT_WAIT`, 120 s). A private repo that the account may not read ends with "no access to the
 repo: ask for read access to it", a server that stays silent with "did not answer"; a password in an address is never
 printed.

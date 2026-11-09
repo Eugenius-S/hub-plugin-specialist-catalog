@@ -203,18 +203,39 @@ def fail_text(repo, err):
     return err[:300]
 
 
-def fetch_commit(src, commit, to):
-    """The package at exactly `commit` in `to` (the commit by itself, shallow; else all branches). "" or the reason."""
+def fetch_commit(src, commit, to, sub=""):
+    """The package at exactly `commit` in `to` (the commit by itself, shallow; else all branches). "" or the reason.
+    With a subfolder only that folder's files come over the wire (a sparse, blobless fetch): the repo may be large."""
     out = git("init", "-q", to)
     if out.returncode:
         return out.stderr.strip()
-    for cmd in (("fetch", "-q", "--depth", "1", "--no-tags", "--", src, commit),
-                ("fetch", "-q", "--no-tags", "--", src, "+refs/heads/*:refs/remotes/origin/*")):
+    where, lean = src, ()
+    if sub:
+        for cmd in (("remote", "add", "origin", src), ("sparse-checkout", "set", "--", sub)):
+            out = git("-C", to, *cmd)
+            if out.returncode:
+                return out.stderr.strip() or f"git {cmd[0]} failed"
+        where, lean = "origin", ("--filter=blob:none",)
+    for cmd in (("fetch", "-q", "--depth", "1", "--no-tags", *lean, "--", where, commit),
+                ("fetch", "-q", "--no-tags", *lean, "--", where, "+refs/heads/*:refs/remotes/origin/*")):
         out = git("-C", to, *cmd)
         if not out.returncode and not git("-C", to, "checkout", "-q", "--detach", commit).returncode:
             got = git("-C", to, "rev-parse", "HEAD").stdout.strip()
             return "" if got == commit else f"got {got[:12]}, not the pinned {commit[:12]}"
     return out.stderr.strip() or f"the commit {commit[:12]} is not in the repo"
+
+
+def clone_head(src, to, sub=""):
+    """The repo's last commit in `to`, without history. With a subfolder only that folder's files come over the wire
+    (the other folders of a large repo are never downloaded). "" or the reason."""
+    if not sub:
+        out = git("clone", "-q", "--depth", "1", "--", src, to)
+        return out.stderr.strip() if out.returncode else ""
+    out = git("clone", "-q", "--depth", "1", "--filter=blob:none", "--sparse", "--", src, to)
+    if out.returncode:
+        return out.stderr.strip() or "git clone failed"
+    out = git("-C", to, "sparse-checkout", "set", "--", sub)   # git refuses a path that is a file or a link
+    return f"no subfolder {sub} in the repo ({out.stderr.strip()[:200]})" if out.returncode else ""
 
 
 def fetch(repo, commit=""):
@@ -235,11 +256,7 @@ def fetch(repo, commit=""):
     src = os.path.abspath(local) if os.path.isdir(local) else whole
     tmp = tempfile.mkdtemp(prefix="specialist-")
     to = os.path.join(tmp, "pkg")
-    if commit:
-        err = fetch_commit(src, commit, to)
-    else:
-        out = git("clone", "-q", "--depth", "1", "--", src, to)
-        err = out.stderr.strip() if out.returncode else ""
+    err = fetch_commit(src, commit, to, sub) if commit else clone_head(src, to, sub)
     if err:
         rmtree_force(tmp)
         die(f"cannot fetch package {hide_login(repo)}: {fail_text(repo, err)}")

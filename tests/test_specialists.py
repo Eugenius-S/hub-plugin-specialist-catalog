@@ -886,6 +886,60 @@ class Subdir(Base):
         self.run_cli("update", "analyst")
         self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.2.0")
 
+    def lean_server(self):
+        """The repo served over file:// like a remote server that allows partial fetches; a big file outside the package."""
+        big = os.path.join(self.repo, "server", "big.bin")
+        pathlib.Path(big).write_bytes(os.urandom(300_000))
+        commit(self.repo, "big site file")
+        for k in ("uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"):
+            subprocess.run(["git", "-C", self.repo, "config", k, "true"], check=True)
+        blob = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD:server/big.bin"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        return pathlib.Path(self.repo).as_uri(), blob
+
+    def kept_clones(self, work):
+        """Run `work` with the temp clones kept; the clones."""
+        kept, real = [], sp.rmtree_force
+        sp.rmtree_force = kept.append
+        try:
+            work()
+        finally:
+            sp.rmtree_force = real
+        for d in kept:
+            self.addCleanup(shutil.rmtree, d, True)
+        return [os.path.join(d, "pkg") for d in kept if os.path.isdir(os.path.join(d, "pkg", ".git"))]
+
+    def has_object(self, clone, sha):
+        env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
+        return not subprocess.run(["git", "-C", clone, "cat-file", "-e", sha], capture_output=True, env=env).returncode
+
+    def test_a_subfolder_never_downloads_the_rest_of_the_repo(self):
+        url, blob = self.lean_server()
+        clones = self.kept_clones(lambda: self.install_addr(f"{url}#{self.SUB}"))
+        self.assertTrue(clones)
+        for clone in clones:
+            self.assertFalse(os.path.exists(os.path.join(clone, "server")), clone)
+            self.assertFalse(self.has_object(clone, blob), clone)
+        self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.1.0")
+
+    def test_a_pinned_subfolder_never_downloads_the_rest_of_the_repo(self):
+        url, blob = self.lean_server()
+        self.pin(head(self.repo), repo=f"{url}#{self.SUB}")
+        clones = self.kept_clones(lambda: self.run_cli("install", "analyst", "--cwd", os.path.join(self.tmp, "work")))
+        self.assertTrue(clones)
+        for clone in clones:
+            self.assertFalse(os.path.exists(os.path.join(clone, "server")), clone)
+            self.assertFalse(self.has_object(clone, blob), clone)
+        rec = self.state_file()["installed"]["analyst"]
+        self.assertEqual((rec["version"], rec["commit"]), ("0.1.0", head(self.repo)))
+        self.put("0.2.0", "second\n")
+        self.pin(head(self.repo), repo=f"{url}#{self.SUB}")
+        self.assertEqual(proc.latest_version(f"{url}#{self.SUB}", head(self.repo)), ("0.2.0", ""))
+        got = proc.changes_of(f"{url}#{self.SUB}", head(self.repo), rec)
+        self.assertIn("+second", got["profile"]["lines"])
+        self.run_cli("update", "analyst")
+        self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.2.0")
+
     def test_a_missing_subfolder_installs_nothing(self):
         out = self.fails("install", f"{self.repo}#hub/specialists/nope", "--cwd", os.path.join(self.tmp, "w"))
         self.assertIn("hub/specialists/nope", out)
