@@ -34,6 +34,12 @@ usual.
 keeps between `<!-- specialists:local -->` and `<!-- /specialists:local -->`: update carries this section into the new
 profile, so the agent gets one whole file to put in place.
 
+**The package folder.** `<hub state>/specialists/packages/<agent>` holds the package itself (skills, assets, the plugins
+sessions point at). install and update put the package of the installed version there (without `.git`): it is built in a
+folder next to it and swapped in, so a failure (a session holds the folder, a full disk) leaves the old folder as it was;
+the next `update` tries again, even when the profile is already the latest. Local sections in the folder's `.md` files
+are carried over like in the agent file. A trial has no such folder.
+
 **Which repo update follows.** A package installed from the catalog follows the catalog: its address and its pinned
 commit, even when the catalog moves the package to another repo (the old repo's head is never taken). A package installed
 from one's own folder or URL keeps that address and gets its head. Records from before this rule count as the catalog's.
@@ -77,7 +83,7 @@ Page strings are English and Russian, by the hub's language.
 ## What it reads, writes and sends
 
 - **Writes** only its own files: `<hub state>/specialists/` (`state.json`: what is installed, version, agent name;
-  `profiles/`: the profile handed to each agent; `trial/`: folders of trial sessions) and `status.json` next to `main.py`
+  `profiles/`: the profile handed to each agent; `packages/<agent>`: the package of the installed version; `trial/`: folders of trial sessions) and `status.json` next to `main.py`
   (the result of "Check for updates"). It does not write `hub.json`, `~/.claude.json`, agent files or any other
   component's files.
 - **Reads**: the catalog (`specialists.json` or the `catalog` setting), the hub's snapshot (`hub status --json`), the agent

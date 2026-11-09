@@ -441,6 +441,117 @@ class UpdateRemove(Base):
         self.assertIn("is not installed", self.fails("remove", "analyst"))
 
 
+class PackageFolder(Base):
+    """<state>/specialists/packages/<agent> is the package's own marketplace folder (skills, assets) that sessions point at:
+    install and update put the package of the right version there, whole and atomically."""
+
+    def setUp(self):
+        super().setUp()
+        package(self.pkg, extra={"plugins/analyst/skills/a.md": "skill v1\n", "ux.md": "old only\n"})
+        commit(self.pkg, "0.1.0")
+        self.folder = os.path.join(sp.own_dir(), "packages", "analyst")
+
+    def release(self, version="0.2.0", claude=CLAUDE, extra=None, drop=()):
+        for d in drop:
+            os.remove(os.path.join(self.pkg, d))
+        package(self.pkg, man={**MAN, "version": version}, claude=claude, extra=extra)
+        commit(self.pkg, version)
+
+    def text(self, rel):
+        return pathlib.Path(self.folder, rel).read_text(encoding="utf-8")
+
+    def leftovers(self):
+        return sorted(x for x in os.listdir(os.path.dirname(self.folder)) if x != "analyst")
+
+    def test_install_puts_the_package_there_without_git(self):
+        self.install()
+        self.assertEqual(self.text("plugins/analyst/skills/a.md"), "skill v1\n")
+        self.assertTrue(os.path.isfile(os.path.join(self.folder, "hub-plugin.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.folder, ".git")))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_trial_has_no_package_folder(self):
+        self.run_cli("install", "analyst", "--trial")
+        self.assertFalse(os.path.exists(self.folder))
+
+    def test_update_replaces_the_folder_with_the_new_version(self):
+        self.install()
+        self.release(extra={"plugins/analyst/skills/a.md": "skill v2\n", "ux-flows.md": "new file\n"}, drop=["ux.md"])
+        self.run_cli("update", "analyst")
+        self.assertEqual(self.text("plugins/analyst/skills/a.md"), "skill v2\n")
+        self.assertEqual(self.text("ux-flows.md"), "new file\n")
+        self.assertFalse(os.path.exists(os.path.join(self.folder, "ux.md")))   # removed upstream: gone here too
+        self.assertEqual(json.loads(self.text("hub-plugin.json"))["version"], "0.2.0")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_update_carries_local_blocks_of_markdown_files(self):
+        self.install()
+        local = f"{sp.LOCAL_OPEN}\nmy own line\n{sp.LOCAL_CLOSE}"
+        pathlib.Path(self.folder, "CLAUDE.md").write_text(CLAUDE + "\n## Notes\nold\n\n" + local + "\n", encoding="utf-8")
+        self.release(claude=CLAUDE + "\n## Notes\nnew text\n\n## End\nx\n")
+        self.run_cli("update", "analyst")
+        text = self.text("CLAUDE.md")
+        self.assertIn("new text", text)
+        self.assertEqual(text.count("my own line"), 1)
+        self.assertLess(text.index("my own line"), text.index("## End"))
+
+    def broken_swap(self, step):
+        """os.replace fails at one step: "out" (the old folder cannot be moved aside, a session holds it) or "in" (the new
+        one cannot take its place)."""
+        real = os.replace
+
+        def flaky(a, b, *x, **k):
+            name = os.path.basename(a)
+            if (step == "out" and name == "analyst") or (step == "in" and name.endswith(".new")):
+                raise PermissionError("held by a session")
+            return real(a, b, *x, **k)
+        os.replace = flaky
+        self.addCleanup(setattr, os, "replace", real)
+        return real
+
+    def test_a_failed_swap_leaves_the_old_folder_whole(self):
+        for step in ("out", "in"):
+            with self.subTest(step=step):
+                self.setUp()
+                self.install()
+                self.release(extra={"plugins/analyst/skills/a.md": "skill v2\n"})
+                real = self.broken_swap(step)
+                try:
+                    out = self.run_cli("update", "analyst")
+                finally:
+                    os.replace = real
+                self.assertEqual(self.text("plugins/analyst/skills/a.md"), "skill v1\n")   # the old folder is intact
+                self.assertTrue(os.path.isfile(os.path.join(self.folder, "ux.md")))
+                self.assertEqual(self.leftovers(), [])                                      # no half-built folder left
+                self.assertIn("package folder NOT updated", out)
+                self.assertEqual(self.state_file()["installed"]["analyst"]["version"], "0.2.0")   # the profile did move on
+                out = self.run_cli("update", "analyst")                                     # retried by the next update
+                self.assertNotIn("NOT updated", out)
+                self.assertEqual(self.text("plugins/analyst/skills/a.md"), "skill v2\n")
+
+    def test_a_folder_that_fell_behind_is_healed_by_update_without_touching_the_agent(self):
+        self.install()
+        self.release(extra={"plugins/analyst/skills/a.md": "skill v2\n"})
+        st = self.state_file()
+        st["installed"]["analyst"].update(version="0.2.0")      # the record says 0.2.0, the folder still has 0.1.0
+        st["installed"]["analyst"].pop("folder", None)
+        sp.save_state(st)
+        self.hub.calls.clear()
+        out = self.run_cli("update", "analyst")
+        self.assertIn("package folder", out)
+        self.assertEqual(self.text("plugins/analyst/skills/a.md"), "skill v2\n")
+        self.assertEqual([c for c in self.hub.calls if c[:2] == ("session", "reload")], [])
+        self.assertEqual(self.sends("analyst"), [])
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
+
+    def test_up_to_date_folder_stays_untouched(self):
+        self.install()
+        marker = pathlib.Path(self.folder, "mine.txt")
+        marker.write_text("x", encoding="utf-8")
+        self.assertIn("is the latest", self.run_cli("update", "analyst"))
+        self.assertTrue(marker.exists())
+
+
 class Adopt(Base):
     def setUp(self):
         super().setUp()

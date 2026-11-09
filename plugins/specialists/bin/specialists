@@ -13,7 +13,9 @@ a CLAUDE.md profile and eval cases).
                                                          (a record only; its CLAUDE.md and tools are left as they are)
     specialists update <agent>                           a new package version: the new profile is handed to the agent
                                                          and verified; sections between <!-- specialists:local --> and
-                                                         <!-- /specialists:local --> are carried over
+                                                         <!-- /specialists:local --> are carried over; the package
+                                                         folder <state>/specialists/packages/<agent> (skills, assets)
+                                                         is replaced whole and atomically (install fills it too)
     specialists remove <agent>                           drop the record; the hub removes the session (the agent file
                                                          stays); a trial session is removed here
 
@@ -354,6 +356,70 @@ def rmtree_force(path):
     shutil.rmtree(path, onexc=unlock) if sys.version_info >= (3, 12) else shutil.rmtree(path, onerror=unlock)
 
 
+# --- package folder ----------------------------------------------------------------------------------------------
+
+def packages_dir(agent):
+    """The package's own marketplace folder (skills, assets) that sessions and hub.json point at."""
+    return os.path.join(own_dir(), "packages", agent)
+
+
+def carry_folder_locals(old, new):
+    """The local blocks of the old folder's markdown files go into the same files of the new one: the same mechanism
+    as for the agent file (a file the new package no longer has loses its blocks: there is no place for them)."""
+    for dirpath, _dirs, files in os.walk(old):
+        for f in files:
+            if not f.endswith(".md"):
+                continue
+            was = os.path.join(dirpath, f)
+            now = os.path.join(new, os.path.relpath(was, old))
+            if LOCAL_OPEN in (read(was) or "") and os.path.isfile(now) and read(now) is not None:
+                body, carried = carry_local(read(now), was)
+                if carried:
+                    write(now, body)
+
+
+def sync_folder(agent, root):
+    """The package at `root` (without .git) becomes <state>/specialists/packages/<agent>: built in a folder next to it,
+    then swapped in; whatever fails, the old folder is back as it was. "" or the reason."""
+    dest = packages_dir(agent)
+    base = os.path.dirname(dest)
+    new, old = (os.path.join(base, f".{agent}.{os.getpid()}.{x}") for x in ("new", "old"))
+    try:
+        os.makedirs(base, exist_ok=True)
+        for p in (new, old):
+            if os.path.lexists(p):
+                rmtree_force(p)
+        shutil.copytree(root, new, ignore=shutil.ignore_patterns(".git"))
+        if os.path.isdir(dest):
+            carry_folder_locals(dest, new)
+            os.replace(dest, old)
+        try:
+            os.replace(new, dest)
+        except OSError:
+            if os.path.isdir(old) and not os.path.lexists(dest):
+                os.replace(old, dest)
+            raise
+        return ""
+    except (OSError, shutil.Error) as e:
+        return str(e)[:200] or type(e).__name__
+    finally:
+        for p in (new, old):
+            if os.path.lexists(p):
+                rmtree_force(p)
+
+
+def put_folder(agent, rec, root, man):
+    """Put the package into its folder and record at what version it stands; a failure is said loud and retried by the
+    next update (no record of the version)."""
+    err = sync_folder(agent, root)
+    if err:
+        rec.pop("folder", None)
+        return say(f"{agent}: package folder NOT updated ({err}); the old one is kept, the next "
+                   f"`specialists update {agent}` tries again: {packages_dir(agent)}")
+    rec["folder"] = head_of(root) or man["version"]
+    say(f"{agent}: package folder {packages_dir(agent)} is at {man['version']}")
+
+
 # --- profile -----------------------------------------------------------------------------------------------------
 
 def fill(text, agent_file, cwd):
@@ -670,6 +736,8 @@ def cmd_install(args):
         else:
             rec.update(agent_file=agent_file_path(sess), profile_file=profile_path(agent))
             write(rec["profile_file"], fill(body, rec["agent_file"], cwd))
+        if not args.trial:
+            put_folder(agent, rec, root, man)
         st = load_state()
         st["installed"][agent] = rec
         save_state(st)
@@ -774,7 +842,12 @@ def cmd_update(args):
         if bad:
             die(f"the new version of {repo} is rejected:\n  - " + "\n  - ".join(bad))
         if man["version"] == rec["version"] and (not pin or rec.get("commit") in ("", None, pin)):
+            if not rec.get("trial") and rec.get("folder") != (head_of(root) or man["version"]):
+                put_folder(agent, rec, root, man)   # the folder fell behind (an older plugin, a failed swap)
+                save_state(st)
             return say(f"{agent}: version {rec['version']} is the latest")
+        if not rec.get("trial"):
+            put_folder(agent, rec, root, man)
         path = rec["agent_file"]
         body, carried = carry_local(fill(read(os.path.join(root, "CLAUDE.md")), path, rec["cwd"]), path)
         before = rec["version"]
